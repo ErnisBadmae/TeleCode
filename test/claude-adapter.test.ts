@@ -24,10 +24,11 @@ async function consume(events: AsyncIterable<AgentProviderEvent>): Promise<void>
 describe("Claude runtime adoption", () => {
   let workspace: string;
   let adapter: ClaudeProviderAdapter;
+  let config: TeleCodeConfig;
 
   beforeEach(() => {
     workspace = mkdtempSync(path.join(tmpdir(), "telecode-claude-adapter-"));
-    adapter = new ClaudeProviderAdapter({
+    config = {
       workspace,
       enableClaudeProvider: true,
       claudeWorkspace: workspace,
@@ -36,13 +37,25 @@ describe("Claude runtime adoption", () => {
       claudePermissionMode: "bypassPermissions",
       claudeTurnIdleTimeoutSeconds: 180,
       claudeAutoCompactWindow: 200000,
-    } as TeleCodeConfig);
+      claudeBin: "C:\\native\\claude.exe",
+    } as TeleCodeConfig;
+    adapter = new ClaudeProviderAdapter(config);
     vi.mocked(runClaudeSdkTurn).mockReset();
   });
 
   afterEach(async () => {
     await adapter.dispose();
     rmSync(workspace, { recursive: true, force: true });
+  });
+
+  it.each([undefined, "C:\\pinned\\claude.exe"])("keeps the SDK executable separate from the native CLI, override=%s", async (override) => {
+    config.claudeSdkBin = override;
+    vi.mocked(runClaudeSdkTurn).mockImplementation(async function* (options) {
+      yield { type: "assistant_message_complete", sessionId: options.sessionId, jobId: options.jobId, text: "ANSWER" };
+    });
+    const created = await adapter.createSession({ workspace });
+    await consume(adapter.sendPrompt({ sessionId: created.id, jobId: "sdk-bin", input: { text: "hello" } }));
+    expect(vi.mocked(runClaudeSdkTurn).mock.calls[0]?.[0].claudeBin).toBe(override);
   });
 
   it.each([false, true])("reuses the original parked runtime after the CLI changes its session id, active=%s", async (active) => {

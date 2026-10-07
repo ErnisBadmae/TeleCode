@@ -25,6 +25,16 @@ function fakeProc(pty: ClaudePty, echoInput = true): Array<{ data: string; at: n
 }
 
 describe("ClaudePty readiness detection", () => {
+  it("waits for startup redraws to settle after the first ready footer", async () => {
+    const pty = new ClaudePty();
+    const startedAt = Date.now();
+    appendPtyText(pty, "Ready. ? for shortcuts");
+    const ready = pty.waitForReadyPrompt(3000);
+    setTimeout(() => appendPtyText(pty, `${"x".repeat(300)} ? for shortcuts`), 150);
+    await expect(ready).resolves.toBe("\\?forshortcuts");
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(650);
+  });
+
   it("does not treat the Claude footer as ready while compaction is still producing output", async () => {
     const pty = new ClaudePty();
     const startedAt = Date.now();

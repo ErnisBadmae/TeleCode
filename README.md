@@ -66,7 +66,8 @@ Everything is text-first and screen-reader friendly: progress, tool activity, pl
    | `CODEX_DEFAULT_LAUNCH_PROFILE` | — | Default launch profile id (defaults to `default`) |
    | `ENABLE_UNSAFE_LAUNCH_PROFILES` | — | Set to `true` to allow `danger-full-access` launch profiles |
    | `ENABLE_CLAUDE_PROVIDER` | — | Set to `true` to enable the Claude Code provider (`false` by default) |
-   | `CLAUDE_BIN` | — | Absolute Claude Code binary path; defaults to `~/.local/bin/claude(.exe)` or PATH |
+   | `CLAUDE_BIN` | Optional | PTY Claude Code binary path; defaults to `~/.local/bin/claude(.exe)` or PATH |
+   | `CLAUDE_SDK_BIN` | Optional | SDK-only executable override; blank uses the CLI bundled with the pinned Agent SDK |
    | `CLAUDE_DEFAULT_MODEL` | — | Default Claude model for new sessions (default `sonnet`, which follows the latest Sonnet release) |
    | `CLAUDE_BACKEND` | — | Default Claude engine: `pty` *(default)* or `sdk` |
    | `CLAUDE_PERMISSION_MODE` | — | `default`, `acceptEdits` *(default)*, `plan`, `bypassPermissions` |

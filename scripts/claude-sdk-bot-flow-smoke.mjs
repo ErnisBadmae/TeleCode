@@ -4,6 +4,8 @@
 //   2. on sdk, every interim narration block reaches Telegram as its own message, in order
 //      (the D3 fix — the PTY smoke cannot pass this)
 //   3. /backend pty rollback drill: a further turn still works and still recalls
+//   4. live steering preserves a running command and ordered narration
+//   5. background completion delivers ordered narration from the parked query
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -38,6 +40,7 @@ try {
   // 1. First turn on the PTY engine, planting a memory.
   await bot.handleUpdate(textUpdate(1, `/claude Remember the secret word ${memoryWord}. Reply with exactly PTY_TURN_OK and nothing else.`, config));
   await waitForCapturedText(sent, "PTY_TURN_OK", 240000);
+  assertNoPtyFallback(sent);
   console.log("[claude-sdk-smoke] pty turn: PASS");
 
   // 2. Switch the engine live.
@@ -74,14 +77,53 @@ try {
   }
   console.log("[claude-sdk-smoke] interim narration delivery (D3 fix): PASS");
 
+  // Exercise Telegram /steer while Bash is running, and repeat narration checks
+  // on the steered response before separately testing the parked-query path.
+  const steerStart = sent.length;
+  const python = process.env.TELECODE_CANARY_PYTHON
+    ?? (process.platform === "win32" ? path.join(baseConfig.workspace, "venv", "Scripts", "python.exe") : "python3");
+  const startedFile = path.join(tempWorkspace, "steer-started.txt");
+  const boundedCommand = `"${python.replaceAll("\\", "/")}" -c "from pathlib import Path; p=Path('${startedFile.replaceAll("\\", "/")}'); p.write_text('running'); import time; time.sleep(12); p.write_text('finished'); print('STEER_COMMAND_DONE')"`;
+  await bot.handleUpdate(textUpdate(5, `Reply STEER_BEFORE. Use Bash in the foreground to run exactly: ${boundedCommand}. Then reply ORIGINAL_REPLY.`, config));
+  await waitFor(() => sent.some((entry, index) => index >= steerStart && entry.text?.includes("Claude started Bash")), 60_000);
+  await waitFor(() => existsSync(startedFile), 60_000);
+  await bot.handleUpdate(textUpdate(6, "/steer Keep the command running to completion. Replace ORIGINAL_REPLY with this sequence: reply STEER_NARRATION_ONE, then use Bash to run echo steer_ok, then reply STEER_NARRATION_TWO, then use Bash to run echo steer_ok2, then finish with exactly STEER_FINAL.", config));
+  await waitForCapturedText(sent, "Steer sent to the active Claude turn.", 30_000);
+  await waitForCapturedText(sent, "STEER_FINAL", 120_000);
+  if (readFileSync(startedFile, "utf8") !== "finished") throw new Error("Steering killed the running command");
+  const steerMarkers = ["STEER_BEFORE", "STEER_NARRATION_ONE", "STEER_NARRATION_TWO", "STEER_FINAL"];
+  const steerIndexes = steerMarkers.map((marker) => sent.findIndex(
+    (entry, index) => index >= steerStart && entry.method === "sendMessage" && entry.text?.includes(marker),
+  ));
+  if (steerIndexes.some((index, position) => index < 0 || (position > 0 && index <= steerIndexes[position - 1]))) {
+    console.log("[claude-sdk-smoke] steering messages:", JSON.stringify(sent.slice(steerStart).filter((entry) => entry.method === "sendMessage").map((entry) => entry.text)));
+    throw new Error(`Steered narration missing, merged or out of order: ${JSON.stringify(steerIndexes)}`);
+  }
+  console.log("[claude-sdk-smoke] live steering + repeated narration block delivery: PASS");
+
+  const backgroundStart = sent.length;
+  const backgroundCommand = `"${python.replaceAll("\\", "/")}" -c "import time; time.sleep(15); print('BG_COMMAND_DONE')"`;
+  await bot.handleUpdate(textUpdate(7, `Use Bash with run_in_background:true to run exactly: ${backgroundCommand}. Reply with exactly BG_STARTED immediately. When its completion notification arrives, reply BG_NARRATION_ONE, then use Bash to run echo bg_ok, then reply BG_NARRATION_TWO, then use Bash to run echo bg_ok2, then finish with exactly BG_FINAL.`, config));
+  await waitForCapturedText(sent, "BG_FINAL", 120_000);
+  const backgroundMarkers = ["BG_STARTED", "BG_NARRATION_ONE", "BG_NARRATION_TWO", "BG_FINAL"];
+  const backgroundIndexes = backgroundMarkers.map((marker) => sent.findIndex(
+    (entry, index) => index >= backgroundStart && entry.method === "sendMessage" && entry.text?.trim() === marker,
+  ));
+  if (backgroundIndexes.some((index, position) => index < 0 || (position > 0 && index <= backgroundIndexes[position - 1]))) {
+    console.log("[claude-sdk-smoke] background messages:", JSON.stringify(sent.slice(backgroundStart).filter((entry) => entry.method === "sendMessage").map((entry) => entry.text)));
+    throw new Error(`Background narration missing, merged or out of order: ${JSON.stringify(backgroundIndexes)}`);
+  }
+  console.log("[claude-sdk-smoke] parked background narration block delivery: PASS");
+
   // 5. Rollback drill: back to pty, same conversation, still recalls.
-  await bot.handleUpdate(textUpdate(5, "/backend pty", config));
+  await bot.handleUpdate(textUpdate(8, "/backend pty", config));
   await waitForCapturedText(sent, "Claude engine for this Telegram context is now pty", 30000);
   const recallStart = sent.length;
-  await bot.handleUpdate(textUpdate(6, "One more time: what was the secret word? Reply with just that word.", config));
+  await bot.handleUpdate(textUpdate(9, "One more time: what was the secret word? Reply with just that word.", config));
   await waitFor(() => sent.some(
     (entry, index) => index >= recallStart && entry.text?.includes(memoryWord),
   ), 240000);
+  assertNoPtyFallback(sent);
   console.log("[claude-sdk-smoke] rollback to pty + continuity: PASS");
 
   console.log("[claude-sdk-smoke] messages sent:", sent.filter((entry) => entry.method === "sendMessage").length);
@@ -126,6 +168,7 @@ function createSmokeConfig(base, workspace) {
     enableUnsafeLaunchProfiles: true,
     streamAssistantText: false,
     progressDelivery: "messages",
+    toolVerbosity: "all",
     showTurnTokenUsage: false,
     enableTelegramLogin: false,
     enableTelegramReactions: false,
@@ -213,6 +256,12 @@ async function waitForCapturedText(sent, expected, timeoutMs) {
   return sent
     .map((entry) => entry.text ?? "")
     .find((text) => text.toUpperCase().includes(expected.toUpperCase()));
+}
+
+function assertNoPtyFallback(sent) {
+  if (sent.some((entry) => entry.text?.includes("switched this chat to the SDK engine for the retry"))) {
+    throw new Error("PTY continuity check used the automatic SDK fallback instead of the PTY engine");
+  }
 }
 
 function assertPidRegistryEmpty(workspace, label) {

@@ -138,6 +138,18 @@ describe("claude sdk engine", () => {
     expect((options.env as Record<string, unknown>).TELEGRAM_BOT_TOKEN).toBeUndefined();
     expect((options.env as Record<string, unknown>).CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBe("200000");
     expect((options.env as Record<string, unknown>).CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS).toBeUndefined();
+    expect((options.env as Record<string, unknown>).DISABLE_AUTOUPDATER).toBe("1");
+  });
+
+  it("uses the SDK's bundled CLI when no SDK executable override is configured", async () => {
+    const { queryFn, seen } = fakeQuery([
+      { type: "system", subtype: "init", session_id: "s" },
+      { type: "result", subtype: "success", result: "ok", usage: {} },
+    ]);
+    await collect(runClaudeSdkTurn({ ...baseOptions, claudeBin: undefined, queryFn }));
+    expect(seen[0]!.options).not.toHaveProperty("pathToClaudeCodeExecutable");
+    expect(seen[0]!.options.permissionMode).toBe("bypassPermissions");
+    expect(seen[0]!.options.strictMcpConfig).toBe(true);
   });
 
   it("maps SDK compact boundaries during ordinary turns", async () => {

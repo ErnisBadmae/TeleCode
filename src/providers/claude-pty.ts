@@ -105,7 +105,10 @@ export class ClaudePty extends EventEmitter {
   async waitForReadyPrompt(timeoutMs: number): Promise<string | null> {
     const deadline = Date.now() + timeoutMs;
     const busyQuietMs = 2500;
+    const readyQuietMs = 500;
     let previousRawLength = this.rawBuffer.length;
+    let previousReceivedBytes = this.receivedBytes;
+    let lastRenderAt = Date.now();
     let lastBusyAt = 0;
     let readyAfterBusy: { source: string; at: number } | null = null;
 
@@ -116,6 +119,12 @@ export class ClaudePty extends EventEmitter {
         ? raw.slice(previousRawLength)
         : raw;
       previousRawLength = raw.length;
+      // The first footer can paint before the renderer accepts input. Wait for
+      // its startup redraws to settle; tiny cursor repaints must not delay forever.
+      if (this.receivedBytes - previousReceivedBytes > INPUT_SETTLE_QUIET_BYTES) {
+        lastRenderAt = now;
+      }
+      previousReceivedBytes = this.receivedBytes;
 
       const compactDelta = stripAnsi(rawDelta).replace(/\s+/g, "").toLowerCase();
       const newBusy = lastMatchingMarker(CLAUDE_BUSY_MARKERS, compactDelta);
@@ -130,10 +139,10 @@ export class ClaudePty extends EventEmitter {
       const compactTail = this.strippedText().slice(-4000).replace(/\s+/g, "").toLowerCase();
       const tailBusy = lastMatchingMarker(CLAUDE_BUSY_MARKERS, compactTail);
       const tailReady = lastMatchingMarker(CLAUDE_READY_MARKERS, compactTail);
-      if (!lastBusyAt && tailReady && !tailBusy) {
+      if (!lastBusyAt && tailReady && !tailBusy && now - lastRenderAt >= readyQuietMs) {
         return tailReady.source;
       }
-      if (readyAfterBusy && now - lastBusyAt >= busyQuietMs) {
+      if (lastBusyAt && readyAfterBusy && now - lastBusyAt >= busyQuietMs && now - lastRenderAt >= readyQuietMs) {
         return readyAfterBusy.source;
       }
       await sleep(250);

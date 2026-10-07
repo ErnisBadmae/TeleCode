@@ -293,6 +293,7 @@ describe("parked sdk queries", () => {
     );
 
     controlled.push(textMessage("NO RESULT FOLLOWS"));
+    controlled.push({ type: "system", subtype: "session_state_changed", state: "idle" });
     await waitUntil(() =>
       parkedEvents.some((event) => event.type === "assistant_text_delta" && event.text === "NO RESULT FOLLOWS"),
     );
@@ -900,6 +901,69 @@ describe("parked drain background tasks", () => {
     controlled.push({ type: "system", subtype: "task_notification", task_id: "sdk-task", status: "completed" });
     await waitUntil(() => handle?.pendingTaskCount === 0);
     expect(activity).toEqual([]);
+    controlled.push({ type: "system", subtype: "session_state_changed", state: "idle" });
+    await waitUntil(() => controlled.isClosed());
+  });
+
+  it("keeps steered tools alive from snapshots and ignores independently ordered task bookends", async () => {
+    const controlled = controlledQuery();
+    controlled.push(initMessage);
+    controlled.push({
+      type: "system", subtype: "background_tasks_changed",
+      tasks: [{ task_id: "steered-tool", run_id: "run-2" }, { task_id: "watcher", ambient: true }],
+    });
+    controlled.push(textMessage("ANSWER"));
+    controlled.push(successResult("ANSWER"));
+    let handle: ParkedQuery | undefined;
+    const activity: boolean[] = [];
+    await collect(runClaudeSdkTurn({
+      ...taskParkOptions,
+      queryFn: controlled.queryFn,
+      onParkedEvent: () => {},
+      onParkStateChanged: (parked, query) => { if (parked) handle = query; },
+      onParkActivityChanged: (active) => activity.push(active),
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(controlled.isClosed()).toBe(false);
+    expect(handle?.pendingTaskCount).toBe(1);
+    // A prior run's late completion must not clear the live replacement run.
+    controlled.push({ type: "system", subtype: "task_notification", task_id: "steered-tool", run_id: "run-1", status: "completed" });
+    await waitUntil(() => controlled.waitingReaders() > 0);
+    expect(handle?.pendingTaskCount).toBe(1);
+    controlled.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    // A late edge cannot resurrect a task the level signal already removed.
+    controlled.push({ type: "system", subtype: "task_started", task_id: "steered-tool", is_backgrounded: true });
+    await waitUntil(() => handle?.pendingTaskCount === 0);
+    expect(activity).toEqual([]);
+    await waitUntil(() => controlled.isClosed());
+  });
+
+  it("keeps the task-to-model handoff alive after the snapshot empties, including a quiet running turn", async () => {
+    const controlled = controlledQuery();
+    controlled.push(initMessage);
+    controlled.push({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "bg" }] });
+    controlled.push(textMessage("STARTED"));
+    controlled.push(successResult("STARTED"));
+    const events: AgentProviderEvent[] = [];
+    const activity: boolean[] = [];
+    await collect(runClaudeSdkTurn({
+      ...taskParkOptions, queryFn: controlled.queryFn,
+      onParkedEvent: (event) => events.push(event),
+      onParkActivityChanged: (active) => activity.push(active),
+    }));
+    controlled.push({ type: "system", subtype: "task_notification", task_id: "bg", status: "completed" });
+    controlled.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(controlled.isClosed()).toBe(false);
+    expect(activity).toEqual([]);
+    controlled.push(initMessage);
+    await waitUntil(() => activity.length > 0);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(controlled.isClosed()).toBe(false);
+    controlled.push(textMessage("BACKGROUND FINAL"));
+    controlled.push(successResult("BACKGROUND FINAL"));
+    await waitUntil(() => events.some((e) => e.type === "assistant_message_complete" && e.text === "BACKGROUND FINAL"));
+    expect(activity).toEqual([true, false]);
     await waitUntil(() => controlled.isClosed());
   });
 

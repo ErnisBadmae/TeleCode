@@ -30,7 +30,8 @@ export interface ClaudeSdkTurnOptions {
   jobId: string;
   promptText: string;
   cwd: string;
-  claudeBin: string;
+  /** SDK executable override; omitted keeps the CLI paired with the pinned SDK. */
+  claudeBin?: string;
   model?: string;
   permissionMode: ClaudePermissionMode;
   /** Provider (Claude) session id to resume; omitted for a fresh session. */
@@ -94,7 +95,7 @@ export interface ClaudeSdkTurnOptions {
 
 export interface ClaudeSdkCompactOptions {
   cwd: string;
-  claudeBin: string;
+  claudeBin?: string;
   model?: string;
   permissionMode: ClaudePermissionMode;
   /** Existing provider session to compact in place. */
@@ -130,6 +131,8 @@ export interface SdkMessageLike {
   scope?: "session" | "local";
   state?: "idle" | "running" | "requires_action";
   task_id?: string;
+  run_id?: string;
+  tasks?: Array<{ task_id: string; run_id?: string; ambient?: boolean }>;
   status?: string | null;
   is_backgrounded?: boolean;
   ambient?: boolean;
@@ -434,7 +437,8 @@ export class ParkedQuery implements AsyncIterable<SdkMessageLike> {
   }
 
   /**
-   * Background tasks the CLI launched and has not been told the outcome of yet.
+   * Background work that keeps the query alive. New CLIs report its live set;
+   * older ones track launches until their outcome notification arrives.
    *
    * Claude Code ends the turn as soon as it starts one and re-enters itself when the
    * task notification arrives, often minutes later. A park holding one of these is
@@ -442,18 +446,41 @@ export class ParkedQuery implements AsyncIterable<SdkMessageLike> {
    * the notification then lands on a query that no longer exists and the work is lost.
    */
   private readonly pendingTasks = new Set<string>();
+  private readonly backgroundTaskRuns = new Map<string, string>();
+  private hasBackgroundTaskSnapshot = false;
 
-  /** How many launched background tasks have yet to report back. */
+  /** How many non-ambient background tasks still keep this query alive. */
   get pendingTaskCount(): number {
     return this.pendingTasks.size;
   }
 
+  hasPendingTask(taskId: string, runId?: string): boolean {
+    const currentRun = this.backgroundTaskRuns.get(taskId);
+    return this.pendingTasks.has(taskId) && (!runId || !currentRun || runId === currentRun);
+  }
+
   /**
-   * Feed every SDK message through here to keep that set current. Launches are read
-   * from the tool result the CLI receives, completions from the task notification the
-   * CLI is re-entered with.
+   * New CLIs send a complete background-task snapshot, including tools moved into
+   * the background by steering. Once available it is authoritative; mixing its
+   * membership with the independently ordered task bookends can revive stale work.
+   * Older CLIs fall back to task bookends and textual tool results.
    */
   trackMessage(message: SdkMessageLike): void {
+    if (message.type === "system" && message.subtype === "background_tasks_changed" && Array.isArray(message.tasks)) {
+      this.hasBackgroundTaskSnapshot = true;
+      this.pendingTasks.clear();
+      this.backgroundTaskRuns.clear();
+      for (const task of message.tasks) {
+        if (task.task_id && !task.ambient) {
+          this.pendingTasks.add(task.task_id);
+          if (task.run_id) this.backgroundTaskRuns.set(task.task_id, task.run_id);
+        }
+      }
+      return;
+    }
+    if (this.hasBackgroundTaskSnapshot) {
+      return;
+    }
     if (message.type === "system" && message.task_id) {
       if (message.subtype === "task_notification") {
         this.pendingTasks.delete(message.task_id);
@@ -692,6 +719,7 @@ async function drainParkedSdkQuery(args: {
   try {
     let bufferedText = "";
     let finalAssistantText = "";
+    let continuationDeadline: number | undefined;
     let flushDeadline: number | undefined;
     let flushHardDeadline: number | undefined;
     const flushText = (): void => {
@@ -717,7 +745,13 @@ async function drainParkedSdkQuery(args: {
       const awaitingTask = args.handle.pendingTaskCount > 0;
       const capMs = awaitingTask ? Math.max(args.hardCapMs, PARK_PENDING_TASK_CAP_MS) : args.hardCapMs;
       const capRemaining = capMs - (now - startedAt);
-      const idleRemaining = awaitingTask ? capRemaining : Math.min(args.parkIdleMs, capRemaining);
+      // Finishing a task removes it from the live snapshot before its follow-up
+      // model call emits text. Keep that handoff alive, then keep a running turn
+      // alive through quiet model/tool intervals. The hard cap still bounds both.
+      const continuationRemaining = Math.max(0, (continuationDeadline ?? 0) - now);
+      const idleRemaining = awaitingTask || active
+        ? capRemaining
+        : Math.min(Math.max(args.parkIdleMs, continuationRemaining), capRemaining);
       if (idleRemaining <= 0) {
         break;
       }
@@ -758,11 +792,26 @@ async function drainParkedSdkQuery(args: {
         break;
       }
       const message = outcome.result.value;
+      if (
+        message.type === "system" && message.subtype === "task_notification" &&
+        message.task_id && args.handle.hasPendingTask(message.task_id, message.run_id) &&
+        !message.ambient && !message.skip_transcript
+      ) {
+        continuationDeadline = Date.now() + 30_000;
+      }
       args.handle.trackMessage(message);
+      if (message.type === "system" && message.subtype === "init" && continuationDeadline !== undefined) {
+        // A fresh init after our task's completion starts its injected turn.
+        // Unrelated idle metadata must not mark a parked query as working.
+        setActive(true);
+        continuationDeadline = undefined;
+        continue;
+      }
       if (message.type === "system" && message.subtype === "session_state_changed") {
         // The SDK's idle state is authoritative. Metadata and ambient task
         // notifications after a result must not invent another running turn.
         setActive(message.state === "running" || message.state === "requires_action");
+        if (message.state === "idle") continuationDeadline = undefined;
         continue;
       }
       if (message.type === "assistant") {
@@ -818,6 +867,7 @@ async function drainParkedSdkQuery(args: {
         continue;
       }
       if (message.type === "result") {
+        continuationDeadline = undefined;
         if (message.subtype !== "success") {
           const detail = message.result?.trim() || describeSdkErrors(message.errors) || message.subtype || "unknown error";
           bridgeLog("park", `parked sdk turn ended: ${detail} session=${sessionLabel}`);
@@ -1492,7 +1542,7 @@ export interface ClaudeModelInfo {
  * right now ("opus" -> "claude-opus-5-5"). No prompt is sent, so no tokens are spent.
  */
 export async function probeClaudeModels(options: {
-  claudeBin: string;
+  claudeBin?: string;
   cwd: string;
   timeoutMs?: number;
 }): Promise<ClaudeModelInfo[]> {
@@ -1538,7 +1588,7 @@ async function loadSdkQuery(): Promise<NonNullable<ClaudeSdkTurnOptions["queryFn
 
 function buildSdkQueryOptions(options: {
   cwd: string;
-  claudeBin: string;
+  claudeBin?: string;
   model?: string;
   permissionMode: ClaudePermissionMode;
   resume?: string;
@@ -1550,7 +1600,7 @@ function buildSdkQueryOptions(options: {
     cwd: options.cwd,
     model: options.model,
     permissionMode: options.permissionMode,
-    pathToClaudeCodeExecutable: options.claudeBin,
+    ...(options.claudeBin ? { pathToClaudeCodeExecutable: options.claudeBin } : {}),
     // Behave like the user's interactive sessions: Claude Code system prompt,
     // user + project settings, CLAUDE.md, and skills.
     systemPrompt: { type: "preset", preset: "claude_code" },
@@ -1585,6 +1635,8 @@ function scrubbedEnv(
   workspace?: string,
 ): Record<string, string | undefined> {
   const env: Record<string, string | undefined> = { ...process.env };
+  // Updates belong to TeleCode's dependency rollout, never an SDK child process.
+  env.DISABLE_AUTOUPDATER = "1";
   delete env.TELEGRAM_BOT_TOKEN;
   for (const key of Object.keys(env)) {
     if (

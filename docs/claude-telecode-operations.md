@@ -38,6 +38,7 @@ If `CLAUDE_DEFAULT_MODEL=default` is explicitly set, TeleCode omits `--model` an
 
 Runtime rules:
 
+- SDK sessions and model discovery use the executable bundled with the pinned Agent SDK. `CLAUDE_SDK_BIN` overrides it; `CLAUDE_BIN` applies to PTY sessions. SDK children have background auto-updates disabled so a dependency rollout controls their CLI version.
 - `ENABLE_CLAUDE_PROVIDER=true` must be set in `.env`.
 - `CLAUDE_STRICT_MCP_CONFIG=true` should stay set while using the real `~/.claude` config.
 - TeleCode strips inherited `CLAUDECODE` and `CLAUDE_CODE_*` variables before spawning Claude.
@@ -49,9 +50,16 @@ Runtime rules:
 - In the foreground, Claude model fallbacks and safeguard refusals are reported before held narration, including the models and reason when supplied. Background status notices and commentary stay buffered for `/replay`.
 - If Claude finishes while another provider or Claude session is selected, TeleCode sends the final answer directly with a session header. This also applies to follow-up work from a kept-alive SDK query. Select the session and use `/replay all` to read its interim messages; selecting it alone does not release background commentary.
 - SDK idle and running session-state events determine whether a kept-alive Claude query is working. Idle metadata and task progress do not start a new turn.
+- Background task snapshots keep SDK queries alive for tools moved into the background by steering. Ambient watchers do not hold them open. Once snapshots arrive, independently ordered task bookends cannot revive finished work.
+- Task completion starts a bounded handoff wait until Claude begins its follow-up turn. A running follow-up survives quiet model and tool intervals, subject to the park's hard deadline.
+- PTY startup waits for substantial redraws to settle before typing. The SDK bot-flow smoke rejects an automatic SDK fallback during its PTY checks.
 - Background reply headers use the current title of the conversation that produced the reply, including native transcript titles and names set with `/rename`. Renaming during a running turn or while output is awaiting delivery keeps the new name. Restoring another Codex thread does not reuse an old conversation's record or title.
 
 Self-test:
+
+`npm run test:provider-compat` runs a live upgrade canary against both providers using temporary workspaces and no Telegram API. It checks Codex initialization, tools, resume, fork, steering, stopping, compaction and MCP server status, plus Claude model discovery, narration, resume, fork, live steering, delayed background answers, stopping and compaction. Set `TELECODE_CANARY_PYTHON` if the bounded shell tests need a different Python executable. Run it serially with the Claude bot-flow smoke tests. For a focused rerun, use `node scripts/provider-compat-smoke.mjs --codex-only`, `--steer-only`, or `--background-only`.
+
+`npm run test:claude-sdk-smoke` verifies PTY to SDK and back with conversation memory preserved. It repeats narration checks after a live `/steer` and separately after background command completion, requiring each narration block and final answer to arrive as a separate mocked Telegram message in order. Its steering stimulus waits for the bounded shell command to write a start marker before sending `/steer`, proving the command is actually running, and requires its finish marker to prove steering preserved the command. Claude may apply the steer at a safe tool boundary instead of answering during the command.
 
 ```powershell
 npm run test:claude-tool-smoke

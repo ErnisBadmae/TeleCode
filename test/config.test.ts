@@ -44,6 +44,7 @@ describe("loadConfig", () => {
     delete process.env.ENABLE_TELEGRAM_REACTIONS;
     delete process.env.ENABLE_CLAUDE_PROVIDER;
     delete process.env.CLAUDE_BIN;
+    delete process.env.CLAUDE_SDK_BIN;
     delete process.env.CLAUDE_DEFAULT_MODEL;
     delete process.env.CLAUDE_BACKEND;
     delete process.env.CLAUDE_WORKSPACE;
@@ -133,6 +134,7 @@ describe("loadConfig", () => {
       enableTelegramReactions: false,
       enableClaudeProvider: false,
       claudeBin: defaultClaudeBinForTest(),
+      claudeSdkBin: undefined,
       claudeConfigDir: path.join(homedir(), ".telecode", "claude-config"),
       claudeStrictMcpConfig: true,
       claudeDefaultModel: "sonnet",
@@ -377,6 +379,7 @@ describe("loadConfig", () => {
     process.env.TELEGRAM_ALLOWED_USER_IDS = "123";
     process.env.ENABLE_CLAUDE_PROVIDER = "true";
     process.env.CLAUDE_BIN = path.join(tempDir, "claude.exe");
+    process.env.CLAUDE_SDK_BIN = path.join(tempDir, "sdk-claude.exe");
     process.env.CLAUDE_CONFIG_DIR_OVERRIDE = path.join(tempDir, "claude-config");
     process.env.CLAUDE_DEFAULT_MODEL = "opus";
     process.env.CLAUDE_WORKSPACE = path.join(tempDir, "claude-workspace");
@@ -392,6 +395,7 @@ describe("loadConfig", () => {
 
     expect(config.enableClaudeProvider).toBe(true);
     expect(config.claudeBin).toBe(path.join(tempDir, "claude.exe"));
+    expect(config.claudeSdkBin).toBe(path.join(tempDir, "sdk-claude.exe"));
     expect(config.claudeConfigDir).toBe(path.join(tempDir, "claude-config"));
     expect(config.claudeStrictMcpConfig).toBe(false);
     expect(config.claudeDefaultModel).toBe("opus");

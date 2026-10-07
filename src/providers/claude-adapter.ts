@@ -631,7 +631,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
         jobId,
         promptText,
         cwd: runtime.workspace,
-        claudeBin: this.config.claudeBin,
+        claudeBin: this.config.claudeSdkBin,
         model: runtime.model,
         permissionMode: runtime.permissionMode,
         resume: runtime.forkSourceSessionId ?? (runtime.hasLiveProviderSession ? runtime.providerSessionId : undefined),
@@ -778,7 +778,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
         try {
           const result = await runClaudeSdkCompact({
             cwd: runtime.workspace,
-            claudeBin: this.config.claudeBin,
+            claudeBin: this.config.claudeSdkBin,
             model: runtime.model,
             permissionMode: runtime.permissionMode,
             resume: runtime.providerSessionId,
@@ -845,7 +845,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
       return this.modelCatalog.models;
     }
     this.modelCatalogProbe ??= probeClaudeModels({
-      claudeBin: this.config.claudeBin,
+      claudeBin: this.config.claudeSdkBin,
       cwd: this.config.claudeWorkspace,
     });
     try {

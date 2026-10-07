@@ -43,6 +43,8 @@ export interface TeleCodeConfig {
   enableTelegramReactions: boolean;
   enableClaudeProvider: boolean;
   claudeBin: string;
+  /** SDK-only override; omitted uses the executable bundled with the pinned SDK. */
+  claudeSdkBin?: string;
   claudeConfigDir: string;
   claudeStrictMcpConfig: boolean;
   claudeDefaultModel: string;
@@ -108,6 +110,7 @@ export function loadConfig(): TeleCodeConfig {
   );
   const enableClaudeProvider = parseBooleanEnv(optionalString(process.env.ENABLE_CLAUDE_PROVIDER), false);
   const claudeBin = optionalString(process.env.CLAUDE_BIN) ?? defaultClaudeBin();
+  const claudeSdkBin = optionalString(process.env.CLAUDE_SDK_BIN);
   // Isolated config dir for TeleCode-spawned claude.exe. Pointing CLAUDE_CONFIG_DIR
   // at a folder that does NOT contain the user-scoped telegram plugin keeps the child
   // from starting a competing getUpdates poller and 409ing the live Telegram bridge.
@@ -193,6 +196,7 @@ export function loadConfig(): TeleCodeConfig {
     enableTelegramReactions,
     enableClaudeProvider,
     claudeBin,
+    claudeSdkBin,
     claudeConfigDir,
     claudeStrictMcpConfig,
     claudeDefaultModel,
