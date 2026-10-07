@@ -1,6 +1,6 @@
 # Roundtable design: multi-agent collaboration in TeleCode
 
-Status: roundtable and scoped review features are design only. Background session support is built. Last updated 2026-10-07.
+Status: scoped peer reviews and background session support are built. The full roundtable remains design only. Last updated 2026-10-07.
 
 This document captures the design discussion for letting Claude, Codex, and any other provider TeleCode runs work together, on one machine and later across machines through Telegram. Pick up from here. The decisions below were made by the owner (Anthony) and should not be relitigated without him.
 
@@ -18,19 +18,19 @@ Step 2, the roundtable, is designed below and not built.
 
 There is currently no second machine to pair with. Cross-machine work is future work, so the local roundtable comes first.
 
-## Next feature: scoped cross-provider reviews
+## Built: scoped cross-provider reviews
 
-Requested and clarified by Anthony on 2026-10-07. Design only, not implemented. Claude can ask Codex for a review or second opinion, and Codex can ask Claude. The calling agent chooses the reviewer model, effort, working directory and question. Anthony wants a simple formalization of capabilities the installed CLIs already have, with independent initial judgment and optional discussion afterward.
+Requested, clarified and approved by Anthony on 2026-10-07. Implemented as `skills/peer-review/SKILL.md` plus its `scripts/peer-review.mjs` helper. Claude can ask Codex for a review or second opinion, and Codex can ask Claude. The caller chooses provider, model, effort, absolute working directory and question on every call, including follow-ups. The skill's entire metadata mapping is one short line to keep discovery context small.
 
 ### Smallest useful implementation
 
-One shared `peer-review` skill and one invocation helper, with no TeleCode runtime or Telegram command changes in the first version. Both providers discover the same skill, using the existing shared-skill arrangement. A memory note points to it; it does not duplicate the instructions or implementation.
+One shared `peer-review` skill and one invocation helper, with no new Telegram command or MCP service. Both providers discover the same skill, using the existing shared-skill arrangement. A memory note points to it; it does not duplicate the instructions or implementation. An independent live review exposed one necessary bridge adjustment: hide these CLI conversations from ordinary Codex/Claude session browsing, so `latest` and `previous` do not select a reviewer.
 
 The skill explains when and how to request another provider's opinion, select useful context, and resume a discussion. The helper handles the mechanics that are fragile to repeat in shell commands: Windows argument handling, inherited environment, provider output parsing, explicit session IDs, deadlines and child-process cleanup. Use the installed, paired CLI/SDK versions and existing authentication. Do not introduce another agent framework or provider dependency.
 
 Keep the helper interface small: one request containing `provider`, `model`, `effort`, `cwd` and `prompt`; an optional `resume` session ID and timeout. Require model, effort and directory on each call, including follow-ups, so ambient settings or a different active Telegram session cannot decide them. Use structured input rather than inserting prompt text into shell command strings. The result contains the answer, provider session ID, requested settings and any provider-reported applied settings, plus a clear failure or timeout when appropriate. Do not claim an effective setting that the provider does not expose. Claude can lower an unsupported or capped effort, so a requested level and an applied level must remain distinct.
 
-Create a fresh local reviewer session by default. Resume only the explicit ID returned by this helper; never use `--last` or `--continue`, or attach to an existing user's busy session. The helper does not register the reviewer in TeleCode's session selector or change `/model`, `/effort`, the selected session, or defaults for `/new`.
+Create a fresh local reviewer session by default. Resume only the explicit ID returned by this helper; never use `--last` or `--continue`, or attach to an existing user's busy session. Small ID markers live in `%LOCALAPPDATA%\TeleCode\peer-reviews` on Windows, or `~/.local/state/TeleCode/peer-reviews` elsewhere. They contain provider, directory and readiness, no prompts or credentials. Register them before/at provider startup and keep them while provider transcripts exist. The bridge uses these IDs to exclude reviewers from its normal session listings. Codex's native `thread_source` tag is also filtered, including before the ID marker arrives. The helper does not change `/model`, `/effort`, the selected session, or defaults for `/new`.
 
 ### Context and discussion
 
@@ -38,13 +38,13 @@ The caller supplies the question, relevant facts, constraints and selected file 
 
 For an independent first opinion, omit the caller's preferred conclusion and ask for findings with evidence. After receiving it, the caller can resume that reviewer with a counterargument or a focused question. Each invocation is one turn; the caller decides whether another turn is useful. Normally stop after the initial review and at most two follow-ups, unless Anthony asks for more discussion. Preserve unresolved disagreement instead of forcing a consensus. The reviewer must not invoke further peer reviews.
 
-Read-only review is the first version's scope. Codex uses its read-only sandbox with unattended approvals disabled. Claude uses an actual read-only tool allowlist and permission enforcement, with no write tools, arbitrary shell or inherited MCP servers. Disable inherited hooks and scrub Telegram credentials so a reviewer cannot start another polling plugin or run a hook outside the tool restrictions. Pass needed diff or command results from the caller. Another agent's advice is not human approval.
+Read-only review is the first version's scope. Codex uses its read-only sandbox with approvals disabled; on Windows the helper explicitly selects the unelevated sandbox for unattended operation. Ignore user config and disable apps, plugins, hooks and multi-agent tools for reviewers. Claude uses only Read/Grep/Glob, `dontAsk` permission mode and no approval surface, hooks or inherited MCP servers. Scrub Telegram credentials and inherited session/model/effort variables while retaining authentication and platform selectors. Pass needed diff or command results from the caller. Another agent's advice is not human approval.
 
-The result returns directly to the calling agent through the command/tool response. Its normal TeleCode narration tells Anthony who was consulted and summarizes findings, decisions and disagreements. No direct reviewer Telegram delivery, request registry, floor manager or automatic debate loop is needed. A normal timeout must terminate the review process tree and return a useful error without leaving the Telegram turn blocked; preserve TeleCode's detached-launch rule if a later use case truly needs background execution.
+The result returns directly to the calling agent through the command/tool response. Its normal TeleCode narration tells Anthony who was consulted and summarizes findings, decisions and disagreements. No direct reviewer Telegram delivery, floor manager or automatic debate loop is needed. A supervisor terminates the review process tree after completion, cancellation or timeout. The worker also watches IPC disconnect and has its own deadline, so killing the caller abruptly cannot leave it running indefinitely. Preserve TeleCode's detached-launch rule if a use case needs background execution.
 
 ### Verification and scope
 
-Before marking this built, run real Claude-to-Codex and Codex-to-Claude calls in isolated workspaces. Verify explicit model/effort/directory handling, independent first-review context, explicit-ID follow-up continuity, denied file writes, safe inherited environment, timeout cleanup and unavailable-provider failure. Check that unrelated parallel sessions and their effort settings remain unchanged. Exercise the caller's narration path; existing steering/narration regression checks remain part of the release checks.
+`scripts/peer-review-smoke.mjs` runs real Claude-to-Codex and Codex-to-Claude calls in an isolated workspace, plus independent evidence inspection, explicit-ID follow-ups, denied write requests, unavailable-model failure and session-list exclusion. Focused unit tests cover caller choices, literal prompts, isolated parallel settings, failures/crashes, deadlines, caller loss and installed skill junctions. The existing Claude steering/narration release canary remains available separately.
 
 Only add a TeleCode MCP tool or `/review` command if actual use shows the skill/helper route is inconvenient. The full roundtable and cross-machine coordination remain separate future work.
 
@@ -53,6 +53,7 @@ Capability evidence checked 2026-10-07 against installed Codex 0.160.1 and Claud
 - OpenAI non-interactive execution and explicit-ID continuation: https://learn.chatgpt.com/docs/non-interactive-mode
 - Claude CLI model, effort and resume flags: https://code.claude.com/docs/en/cli-reference
 - Claude effort support and downgrade/cap behavior: https://code.claude.com/docs/en/model-config
+- Native Windows sandbox configuration: https://learn.chatgpt.com/docs/windows/windows-sandbox
 
 ## Decisions already made
 

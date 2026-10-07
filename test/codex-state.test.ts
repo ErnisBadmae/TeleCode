@@ -10,6 +10,7 @@ type ThreadFixture = {
   updated_at: number;
   first_user_message: string;
   archived?: number;
+  thread_source?: string;
 };
 
 type SpawnEdgeFixture = {
@@ -28,6 +29,7 @@ type LoadOptions = {
   betterSqliteAvailable?: boolean;
   openThrows?: boolean;
   spawnTableMissing?: boolean;
+  peerReviewIds?: string[];
 };
 
 const originalHome = process.env.HOME;
@@ -35,6 +37,7 @@ const originalHome = process.env.HOME;
 afterEach(() => {
   vi.doUnmock("node:fs");
   vi.doUnmock("better-sqlite3");
+  vi.doUnmock("../src/peer-review-sessions.js");
   vi.resetModules();
 
   if (originalHome === undefined) {
@@ -55,6 +58,9 @@ async function loadCodexState(options: LoadOptions = {}) {
   process.env.HOME = home;
 
   vi.resetModules();
+  vi.doMock("../src/peer-review-sessions.js", () => ({
+    getPeerReviewSessionIds: () => new Set(options.peerReviewIds ?? []),
+  }));
 
   vi.doMock("node:fs", () => ({
     existsSync: vi.fn((targetPath: string) => {
@@ -114,6 +120,27 @@ async function loadCodexState(options: LoadOptions = {}) {
   return await import("../src/codex-state.js");
 }
 
+it("keeps peer reviews out of latest/previous browsing without starving its limit", async () => {
+  const state = await loadCodexState({
+    files: ["state_1.sqlite"], peerReviewIds: ["peer-newest", "peer-second"],
+    threads: ["ordinary", "peer-second", "peer-newest"].map((id, index) => ({
+      id, title: id, cwd: "/workspace", model: "gpt-6.1-sol", created_at: index + 1, updated_at: index + 1, first_user_message: id,
+    })),
+  });
+  expect(state.listThreads(1).map((thread) => thread.id)).toEqual(["ordinary"]);
+});
+
+it("hides a Codex reviewer from native source metadata before its ID marker arrives", async () => {
+  const state = await loadCodexState({
+    files: ["state_1.sqlite"],
+    threads: ["ordinary", "unmarked-review"].map((id, index) => ({
+      id, title: id, cwd: "/workspace", model: "gpt-6.1-sol", created_at: index + 1, updated_at: index + 1, first_user_message: id,
+      ...(index === 1 ? { thread_source: "telecode-peer-review" } : {}),
+    })),
+  });
+  expect(state.listThreads(1).map((thread) => thread.id)).toEqual(["ordinary"]);
+});
+
 function runAllQuery(
   sql: string,
   threads: ThreadFixture[],
@@ -150,6 +177,7 @@ function runAllQuery(
   }
 
   if (sql.includes("FROM threads")) {
+    if (sql.includes("WHERE thread_source = ?")) return threads.filter((thread) => thread.thread_source === args[0]);
     if (sql.includes("id LIKE ?")) {
       const prefix = String(args[0] ?? "").replace(/%$/, "");
       return threads

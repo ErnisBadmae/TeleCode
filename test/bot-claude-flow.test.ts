@@ -14,6 +14,9 @@ const mockVendorUsage = vi.hoisted(() => ({
   read: vi.fn(async () => "Mock Qwen plan usage"),
 }));
 
+const mockPeerReviews = vi.hoisted(() => new Set<string>());
+vi.mock("../src/peer-review-sessions.js", () => ({ getPeerReviewSessionIds: () => mockPeerReviews }));
+
 vi.mock("../src/usage-vendors.js", () => ({
   USAGE_READERS: {
     modelstudio: {
@@ -1811,6 +1814,29 @@ describe("Claude bot flow", () => {
     await bot.handleUpdate(textUpdate(3, "/claude"));
     await bot.handleUpdate(textUpdate(4, "/replay all"));
     expect(sent.some((entry) => entry.text?.includes("QUEUED_PARK_PROGRESS"))).toBe(true);
+  });
+
+  it("hides a registered Claude peer review from /sessions while keeping ordinary sessions", async () => {
+    const { bot, sent } = await createTestBot(tempDir, { claudeStrictMcpConfig: false });
+    await bot.handleUpdate(textUpdate(1, "/claude first turn"));
+    await waitForAgentSessionsIdle(tempDir);
+    const transcriptDir = path.join(tempDir, ".claude-config", "projects", "project");
+    mkdirSync(transcriptDir, { recursive: true });
+    writeFileSync(path.join(transcriptDir, "peer-review-hidden.jsonl"), [
+      JSON.stringify({ type: "user", cwd: tempDir, message: { content: "Review this code" } }),
+      JSON.stringify({ type: "ai-title", aiTitle: "PEER_REVIEW_SHOULD_BE_HIDDEN" }),
+    ].join("\n"));
+    writeFileSync(path.join(transcriptDir, "ordinary-visible.jsonl"), [
+      JSON.stringify({ type: "user", cwd: tempDir, message: { content: "Normal conversation" } }),
+      JSON.stringify({ type: "ai-title", aiTitle: "ORDINARY_SESSION_VISIBLE" }),
+    ].join("\n"));
+    mockPeerReviews.add("peer-review-hidden");
+    try {
+      await bot.handleUpdate(textUpdate(2, "/sessions"));
+      const answer = sent.map((entry) => entry.text).at(-1) ?? "";
+      expect(answer).toContain("ORDINARY_SESSION_VISIBLE");
+      expect(answer).not.toContain("PEER_REVIEW_SHOULD_BE_HIDDEN");
+    } finally { mockPeerReviews.clear(); }
   });
 
   it.each([false, true])("uses the same Claude title for /sessions and parked completion, renamed=%s", async (renamed) => {

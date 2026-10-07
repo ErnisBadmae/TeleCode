@@ -2,6 +2,7 @@ import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, s
 import path from "node:path";
 
 import { isCodexReasoningEffort, type CodexReasoningEffort } from "./reasoning-effort.js";
+import { getPeerReviewSessionIds } from "./peer-review-sessions.js";
 
 export interface CodexThreadRecord {
   id: string;
@@ -126,7 +127,9 @@ export function findLatestDatabase(): string | null {
 }
 
 export function listThreads(limit = 20): CodexThreadRecord[] {
+  const peerReviewIds = getPeerReviewSessionIds();
   const databaseResult = withDatabase((db) => {
+    for (const id of readPeerReviewThreadIds(db)) peerReviewIds.add(id);
     const spawnedThreadIds = readSpawnedThreadIds(db);
     const query = db.prepare(`
       SELECT id, title, cwd, model, created_at, updated_at, first_user_message
@@ -136,7 +139,7 @@ export function listThreads(limit = 20): CodexThreadRecord[] {
       LIMIT ?
     `);
 
-    const rows = query.all(limit + spawnedThreadIds.length) as ThreadRow[];
+    const rows = query.all(limit + spawnedThreadIds.length + peerReviewIds.size) as ThreadRow[];
     return { threads: rows.map(mapThreadRow), spawnedThreadIds };
   });
 
@@ -147,7 +150,7 @@ export function listThreads(limit = 20): CodexThreadRecord[] {
   const spawnedThreadIds = new Set(databaseResult?.spawnedThreadIds ?? []);
   const databaseThreads = databaseResult?.threads ?? [];
   return mergeThreadRecords(databaseThreads, sessionFileFallback(databaseThreads))
-    .filter((thread) => !spawnedThreadIds.has(thread.id))
+    .filter((thread) => !spawnedThreadIds.has(thread.id) && !peerReviewIds.has(thread.id))
     .slice(0, Math.max(1, limit));
 }
 
@@ -210,6 +213,18 @@ function readSpawnedThreadIds(db: DatabaseInstance): string[] {
   } catch {
     // Older Codex databases predate the spawn-edge table. Their threads are all
     // top-level, so session browsing must continue to work without this metadata.
+    return [];
+  }
+}
+
+function readPeerReviewThreadIds(db: DatabaseInstance): string[] {
+  try {
+    return (db.prepare("SELECT id FROM threads WHERE thread_source = ?").all("telecode-peer-review") as Array<{ id?: unknown }>)
+      .map((row) => typeof row.id === "string" ? row.id : "")
+      .filter(Boolean);
+  } catch {
+    // Older databases have no source column. ID markers and JSONL metadata
+    // still filter reviews without breaking browsing on those installations.
     return [];
   }
 }
@@ -450,6 +465,7 @@ export function parseSessionFileThread(
 
       const payload = entry.payload as Record<string, unknown>;
       if (entry.type === "session_meta") {
+        if (payload.thread_source === "telecode-peer-review") return null;
         id = stringValue(payload.id) || stringValue(payload.session_id) || id;
         cwd = stringValue(payload.cwd) || cwd;
         const sessionTimestampMs = Date.parse(stringValue(payload.timestamp));

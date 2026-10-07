@@ -11,6 +11,7 @@ import { Bot, InlineKeyboard, InputFile, type Context } from "grammy";
 import * as pty from "node-pty";
 
 import { bridgeLog, initBridgeLog } from "./bridge-log.js";
+import { getPeerReviewSessionIds } from "./peer-review-sessions.js";
 import { listConfiguredCodexMcpServers } from "./codex-mcp-toggle.js";
 import {
   describeVendorModel,
@@ -11263,6 +11264,7 @@ function listClaudeTranscriptSessions(limit: number, projectsDir: string): Claud
     return [];
   }
 
+  const peerReviewIds = getPeerReviewSessionIds();
   const files: Array<{ path: string; sessionId: string; updatedAt: number; size: number }> = [];
   const visit = (dir: string): void => {
     let entries: Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
@@ -11281,7 +11283,7 @@ function listClaudeTranscriptSessions(limit: number, projectsDir: string): Claud
         continue;
       }
 
-      if (!entry.isFile() || !entry.name.endsWith(".jsonl")) {
+      if (!entry.isFile() || !entry.name.endsWith(".jsonl") || peerReviewIds.has(path.basename(entry.name, ".jsonl"))) {
         continue;
       }
 

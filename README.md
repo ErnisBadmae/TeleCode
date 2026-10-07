@@ -226,6 +226,14 @@ Session metadata (thread ID, workspace, launch profile, model, effort, backend, 
 
 `/effort` changes the selected Codex runtime's next turn and the effort inherited by `/new` in that Telegram context. It is rejected while the selected runtime is working. Parallel background runtimes keep their own effort; selecting a still-running background session restores its runtime and setting. A background completion does not overwrite the selected context's effort.
 
+## Agent peer reviews
+
+The optional shared skill in `skills/peer-review` lets Claude request a Codex second opinion and vice versa. Link that folder into each provider's skills directory, keeping the folder in this checkout so its helper can use the installed dependencies. The metadata has one short description line; this adds no MCP service or Telegram command.
+
+The caller sends JSON to `node skills/peer-review/scripts/peer-review.mjs`, on stdin or through one request-file argument. Required fields are `provider`, `model`, `effort`, `cwd` and `prompt`; optional fields are `resume` and `timeoutMs`. Reviews are read-only and return an answer plus a reviewer session ID for focused follow-ups. The selected Telegram session and its defaults remain unchanged. Small ID markers keep reviewer transcripts outside normal session browsing.
+
+Run `node scripts/peer-review-smoke.mjs` for live cross-provider verification. See the skill for invocation details and `docs/roundtable-design.md` for scope.
+
 ## The Claude Code provider
 
 Set `ENABLE_CLAUDE_PROVIDER=true` and run `/claude` in any context. Two engines are available per context via `/backend`:
