@@ -5,6 +5,7 @@ import {
   type SdkMessageLike,
 } from "../src/providers/claude-sdk-engine.js";
 import type { AgentProviderEvent } from "../src/providers/types.js";
+import { vi } from "vitest";
 
 /**
  * Parked drain: a finished query stays alive briefly and forwards whatever the
@@ -850,6 +851,143 @@ describe("parked drain background tasks", () => {
     parkFlushDebounceMs: 20,
   };
 
+  it("preserves a long task's extended deadline when completion clears its live snapshot", async () => {
+    const controlled = controlledQuery();
+    controlled.push(initMessage);
+    controlled.push({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "long-task" }] });
+    controlled.push(textMessage("STARTED"));
+    controlled.push(successResult("STARTED"));
+    const events: AgentProviderEvent[] = [];
+    const realNow = Date.now.bind(Date);
+    let elapsed = 0;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + elapsed);
+    try {
+      await collect(runClaudeSdkTurn({
+        ...taskParkOptions, parkHardCapMs: 1000, queryFn: controlled.queryFn,
+        onParkedEvent: (event) => events.push(event),
+      }));
+      elapsed = 1500;
+      controlled.push({ type: "system", subtype: "task_notification", task_id: "long-task", status: "completed" });
+      controlled.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+      controlled.push(initMessage);
+      controlled.push(textMessage("LONG TASK FINAL"));
+      controlled.push(successResult("LONG TASK FINAL"));
+      await waitUntil(() => controlled.isClosed() || events.some((event) => event.type === "assistant_message_complete"));
+      expect(events).toContainEqual(expect.objectContaining({ type: "assistant_message_complete", text: "LONG TASK FINAL" }));
+    } finally {
+      controlled.end();
+      clock.mockRestore();
+    }
+  });
+
+  it("allows a delayed legacy text task notification to hand off to a model turn", async () => {
+    const controlled = controlledQuery();
+    controlled.push(initMessage);
+    controlled.push(backgroundLaunch("legacy-task"));
+    controlled.push(textMessage("STARTED"));
+    controlled.push(successResult("STARTED"));
+    const events: AgentProviderEvent[] = [];
+    try {
+      await collect(runClaudeSdkTurn({
+        ...taskParkOptions, queryFn: controlled.queryFn,
+        onParkedEvent: (event) => events.push(event),
+      }));
+      controlled.push(taskNotification("legacy-task"));
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      expect(controlled.isClosed()).toBe(false);
+      controlled.push(initMessage);
+      controlled.push(textMessage("LEGACY TASK FINAL"));
+      controlled.push(successResult("LEGACY TASK FINAL"));
+      await waitUntil(() => events.some((event) => event.type === "assistant_message_complete"));
+    } finally {
+      controlled.end();
+    }
+  });
+
+  it("hands off when an older CLI removes a task snapshot before its completion notification", async () => {
+    const controlled = controlledQuery();
+    controlled.push(initMessage);
+    controlled.push({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "older-order" }] });
+    controlled.push(textMessage("STARTED"));
+    controlled.push(successResult("STARTED"));
+    const events: AgentProviderEvent[] = [];
+    try {
+      await collect(runClaudeSdkTurn({
+        ...taskParkOptions, queryFn: controlled.queryFn,
+        onParkedEvent: (event) => events.push(event),
+      }));
+      controlled.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+      controlled.push({ type: "system", subtype: "task_notification", task_id: "older-order", status: "completed" });
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      expect(controlled.isClosed()).toBe(false);
+      controlled.push(initMessage);
+      controlled.push(textMessage("OLDER ORDER FINAL"));
+      controlled.push(successResult("OLDER ORDER FINAL"));
+      await waitUntil(() => events.some((event) => event.type === "assistant_message_complete"));
+    } finally {
+      controlled.end();
+    }
+  });
+
+  it("does not arm another continuation for duplicate notifications after either snapshot order", () => {
+    for (const notificationFirst of [true, false]) {
+      const handle = new ParkedQuery(controlledQuery().queryFn({ prompt: "", options: {} }), undefined, "test");
+      const notification: SdkMessageLike = { type: "system", subtype: "task_notification", task_id: "duplicate", run_id: "run-1", status: "completed" };
+      const emptySnapshot: SdkMessageLike = { type: "system", subtype: "background_tasks_changed", tasks: [] };
+      handle.trackMessage({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "duplicate", run_id: "run-1" }] });
+      if (!notificationFirst) handle.trackMessage(emptySnapshot);
+      expect(handle.trackMessage(notification)).toBe(true);
+      if (notificationFirst) handle.trackMessage(emptySnapshot);
+      expect(handle.trackMessage(notification)).toBe(false);
+      handle.close();
+    }
+  });
+
+  it("does not mark an unrelated init busy after the task handoff deadline expires", async () => {
+    const controlled = controlledQuery();
+    controlled.push(initMessage);
+    controlled.push({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "quiet-task" }] });
+    controlled.push(textMessage("STARTED"));
+    controlled.push(successResult("STARTED"));
+    const activity: boolean[] = [];
+    const realNow = Date.now.bind(Date);
+    let elapsed = 0;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + elapsed);
+    try {
+      await collect(runClaudeSdkTurn({
+        ...taskParkOptions, parkIdleMs: 60_000, parkHardCapMs: 120_000,
+        queryFn: controlled.queryFn, onParkedEvent: () => {},
+        onParkActivityChanged: (active) => activity.push(active),
+      }));
+      controlled.push({ type: "system", subtype: "task_notification", task_id: "quiet-task", status: "completed" });
+      controlled.push({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+      await waitUntil(() => controlled.queuedCount() === 0 && controlled.waitingReaders() === 1);
+      elapsed = 35_000;
+      controlled.push(initMessage);
+      await waitUntil(() => controlled.queuedCount() === 0 && controlled.waitingReaders() === 1);
+      expect(activity).toEqual([]);
+    } finally {
+      controlled.end();
+      clock.mockRestore();
+    }
+  });
+
+  it("ignores prior run completions on the task-bookend fallback path", () => {
+    const handle = new ParkedQuery(controlledQuery().queryFn({ prompt: "", options: {} }), undefined, "test");
+    handle.trackMessage({ type: "system", subtype: "task_started", task_id: "resumed", run_id: "run-2", is_backgrounded: true });
+    handle.trackMessage({ type: "system", subtype: "task_started", task_id: "resumed", run_id: "run-1", is_backgrounded: true });
+    handle.trackMessage({ type: "system", subtype: "task_notification", task_id: "resumed", run_id: "run-1", status: "completed" });
+    expect(handle.pendingTaskCount).toBe(1);
+    handle.trackMessage({ type: "system", subtype: "task_notification", task_id: "resumed", run_id: "run-2", status: "completed" });
+    expect(handle.pendingTaskCount).toBe(0);
+    handle.trackMessage({ type: "system", subtype: "task_started", task_id: "resumed", run_id: "run-1", is_backgrounded: true });
+    handle.trackMessage({ type: "system", subtype: "task_started", task_id: "resumed", run_id: "run-2", is_backgrounded: true });
+    expect(handle.pendingTaskCount).toBe(0);
+    handle.trackMessage({ type: "system", subtype: "task_started", task_id: "resumed", run_id: "run-3", is_backgrounded: true });
+    expect(handle.pendingTaskCount).toBe(1);
+    handle.close();
+  });
+
   it("outlives the idle timeout while a background task has not reported back", async () => {
     const controlled = controlledQuery();
     controlled.push(initMessage);
@@ -1036,7 +1174,7 @@ describe("parked drain background tasks", () => {
     expect(events.some((event) => event.type === "assistant_message_complete" && event.text === "SECOND")).toBe(true);
   });
 
-  it("closes on the idle timer again once the task has reported back", async () => {
+  it("closes on the idle timer again once the task's follow-up has reported back", async () => {
     const controlled = controlledQuery();
     controlled.push(initMessage);
     controlled.push(backgroundLaunch("btz538txp"));
@@ -1054,6 +1192,7 @@ describe("parked drain background tasks", () => {
     );
 
     controlled.push(taskNotification("btz538txp"));
+    controlled.push(successResult("DONE"));
     // Nothing is owed any more, so the ordinary idle timeout applies and the park ends.
     await waitUntil(() => parkStates.includes(false));
     expect(controlled.isClosed()).toBe(true);

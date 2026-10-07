@@ -225,7 +225,7 @@ describe("Codex background completion flow", () => {
     await bot.handleUpdate(textUpdate(1, "/effort max"));
 
     expect(setReasoningEffort).toHaveBeenCalledWith("max");
-    expect(sent).toContain("Reasoning effort set to max. It applies from the next turn in this context.");
+    expect(sent.some((text) => text.includes("Reasoning effort set to max for the selected session."))).toBe(true);
   });
 });
 

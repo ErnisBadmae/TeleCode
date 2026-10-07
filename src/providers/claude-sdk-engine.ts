@@ -55,7 +55,7 @@ export interface ClaudeSdkTurnOptions {
    * teardown-at-answer behavior).
    */
   parkIdleMs?: number;
-  /** Absolute ceiling on one park, whatever the traffic. Defaults to PARK_HARD_CAP_MS. */
+  /** Base park deadline; pending tasks extend it to at least PARK_PENDING_TASK_CAP_MS. */
   parkHardCapMs?: number;
   /** How long the parked drain groups text before sending. Defaults to PARK_FLUSH_DEBOUNCE_MS. */
   parkFlushDebounceMs?: number;
@@ -363,6 +363,7 @@ const TASK_ID_OPEN = "<task-id>";
 const TASK_ID_CLOSE = "</task-id>";
 const BACKGROUND_TASK_MARKER = "running in background with ID: ";
 const TASK_ID_TERMINATORS = [" ", "\n", "\r", "\t", ".", ","];
+const PARK_TASK_HANDOFF_MS = 30_000;
 /** The CLI's synthetic answer to its own injected rescue prompt; never user-facing. */
 const SYNTHETIC_BOILERPLATE = new Set(["No response requested."]);
 
@@ -447,6 +448,8 @@ export class ParkedQuery implements AsyncIterable<SdkMessageLike> {
    */
   private readonly pendingTasks = new Set<string>();
   private readonly backgroundTaskRuns = new Map<string, string>();
+  /** Completion eligibility is separate from liveness: snapshots and notices can arrive in either order. */
+  private readonly taskContinuations = new Map<string, { runId?: string; expiresAt?: number }>();
   private hasBackgroundTaskSnapshot = false;
 
   /** How many non-ambient background tasks still keep this query alive. */
@@ -464,39 +467,79 @@ export class ParkedQuery implements AsyncIterable<SdkMessageLike> {
    * the background by steering. Once available it is authoritative; mixing its
    * membership with the independently ordered task bookends can revive stale work.
    * Older CLIs fall back to task bookends and textual tool results.
+   * Returns true when a tracked task completed and needs a model follow-up.
    */
-  trackMessage(message: SdkMessageLike): void {
+  trackMessage(message: SdkMessageLike): boolean {
+    const now = Date.now();
+    for (const [id, candidate] of this.taskContinuations) {
+      if (candidate.expiresAt !== undefined && candidate.expiresAt <= now) this.taskContinuations.delete(id);
+    }
+    let needsContinuation = false;
+    if (message.type === "system" && message.subtype === "task_notification" && message.task_id) {
+      const candidate = this.taskContinuations.get(message.task_id);
+      if (candidate && (!message.run_id || !candidate.runId || message.run_id === candidate.runId)) {
+        this.taskContinuations.delete(message.task_id);
+        needsContinuation = !message.ambient && !message.skip_transcript;
+      }
+    }
     if (message.type === "system" && message.subtype === "background_tasks_changed" && Array.isArray(message.tasks)) {
       this.hasBackgroundTaskSnapshot = true;
+      const previousTasks = new Set(this.pendingTasks);
+      const previousRuns = new Map(this.backgroundTaskRuns);
       this.pendingTasks.clear();
       this.backgroundTaskRuns.clear();
       for (const task of message.tasks) {
         if (task.task_id && !task.ambient) {
+          if (!previousTasks.has(task.task_id) || previousRuns.get(task.task_id) !== task.run_id) {
+            this.taskContinuations.set(task.task_id, { runId: task.run_id });
+          } else {
+            const candidate = this.taskContinuations.get(task.task_id);
+            if (candidate) candidate.expiresAt = undefined;
+          }
           this.pendingTasks.add(task.task_id);
           if (task.run_id) this.backgroundTaskRuns.set(task.task_id, task.run_id);
         }
       }
-      return;
+      for (const [id, candidate] of this.taskContinuations) {
+        if (this.pendingTasks.has(id)) continue;
+        if (message.tasks.some((task) => task.task_id === id && task.ambient)) {
+          this.taskContinuations.delete(id);
+        } else {
+          // Older CLIs empty the snapshot before notifying. Remember only
+          // recently removed work, once per run, without reviving its liveness.
+          candidate.expiresAt ??= now + PARK_TASK_HANDOFF_MS;
+        }
+      }
+      return false;
     }
     if (this.hasBackgroundTaskSnapshot) {
-      return;
+      return needsContinuation;
     }
     if (message.type === "system" && message.task_id) {
-      if (message.subtype === "task_notification") {
+      if (message.subtype === "task_notification" && this.hasPendingTask(message.task_id, message.run_id)) {
         this.pendingTasks.delete(message.task_id);
+        // Retain its run identity so a late start cannot revive completed work.
       } else if (
         message.subtype === "task_started" && message.is_backgrounded === true &&
         !message.ambient && !message.skip_transcript
       ) {
+        const currentRun = this.backgroundTaskRuns.get(message.task_id);
+        if (message.run_id && currentRun &&
+          (message.run_id < currentRun || (message.run_id === currentRun && !this.pendingTasks.has(message.task_id)))) return false;
+        if (!this.pendingTasks.has(message.task_id) || (message.run_id && message.run_id !== currentRun)) {
+          this.taskContinuations.set(message.task_id, { runId: message.run_id });
+        }
         this.pendingTasks.add(message.task_id);
+        if (message.run_id) this.backgroundTaskRuns.set(message.task_id, message.run_id);
       }
-      return;
+      return needsContinuation;
     }
     if (message.type !== "user") {
-      return;
+      return false;
     }
     const raw = (message.message as { content?: unknown } | undefined)?.content;
     if (typeof raw === "string") {
+      let matchedCompletion = false;
       let from = 0;
       while (from < raw.length) {
         const open = raw.indexOf(TASK_ID_OPEN, from);
@@ -507,13 +550,15 @@ export class ParkedQuery implements AsyncIterable<SdkMessageLike> {
         if (close < 0) {
           break;
         }
-        this.pendingTasks.delete(raw.slice(open + TASK_ID_OPEN.length, close).trim());
+        const taskId = raw.slice(open + TASK_ID_OPEN.length, close).trim();
+        if (this.pendingTasks.delete(taskId)) matchedCompletion = true;
+        this.taskContinuations.delete(taskId);
         from = close + TASK_ID_CLOSE.length;
       }
-      return;
+      return matchedCompletion;
     }
     if (!Array.isArray(raw)) {
-      return;
+      return false;
     }
     for (const entry of raw) {
       const block = entry as Record<string, unknown>;
@@ -537,11 +582,13 @@ export class ParkedQuery implements AsyncIterable<SdkMessageLike> {
         }
         const id = content.slice(start, end).trim();
         if (id) {
+          if (!this.pendingTasks.has(id)) this.taskContinuations.set(id, {});
           this.pendingTasks.add(id);
         }
         from = end + 1;
       }
     }
+    return false;
   }
 
   /** Called by the drain as it takes the stream; re-arms after a previous handover. */
@@ -697,6 +744,7 @@ async function drainParkedSdkQuery(args: {
   jobId: string;
 }): Promise<void> {
   const startedAt = Date.now();
+  let effectiveHardCapMs = args.hardCapMs;
   const sessionLabel = args.handle.providerSessionId ?? args.sessionId;
   const flushDebounceMs = args.flushDebounceMs ?? PARK_FLUSH_DEBOUNCE_MS;
   const flushMaxHoldMs = args.flushMaxHoldMs ?? PARK_FLUSH_MAX_HOLD_MS;
@@ -743,8 +791,10 @@ async function drainParkedSdkQuery(args: {
       // query first is exactly how a finished test run vanishes instead of being
       // reported. Such a park runs on the pending cap alone.
       const awaitingTask = args.handle.pendingTaskCount > 0;
-      const capMs = awaitingTask ? Math.max(args.hardCapMs, PARK_PENDING_TASK_CAP_MS) : args.hardCapMs;
-      const capRemaining = capMs - (now - startedAt);
+      if (awaitingTask) effectiveHardCapMs = Math.max(effectiveHardCapMs, PARK_PENDING_TASK_CAP_MS);
+      // Completing a long task must not shrink its deadline back below its
+      // already elapsed age, or the follow-up is discarded before it can run.
+      const capRemaining = effectiveHardCapMs - (now - startedAt);
       // Finishing a task removes it from the live snapshot before its follow-up
       // model call emits text. Keep that handoff alive, then keep a running turn
       // alive through quiet model/tool intervals. The hard cap still bounds both.
@@ -792,15 +842,11 @@ async function drainParkedSdkQuery(args: {
         break;
       }
       const message = outcome.result.value;
-      if (
-        message.type === "system" && message.subtype === "task_notification" &&
-        message.task_id && args.handle.hasPendingTask(message.task_id, message.run_id) &&
-        !message.ambient && !message.skip_transcript
-      ) {
-        continuationDeadline = Date.now() + 30_000;
+      if (args.handle.trackMessage(message)) {
+        continuationDeadline = Date.now() + PARK_TASK_HANDOFF_MS;
       }
-      args.handle.trackMessage(message);
-      if (message.type === "system" && message.subtype === "init" && continuationDeadline !== undefined) {
+      if (message.type === "system" && message.subtype === "init" &&
+        continuationDeadline !== undefined && continuationDeadline > Date.now()) {
         // A fresh init after our task's completion starts its injected turn.
         // Unrelated idle metadata must not mark a parked query as working.
         setActive(true);

@@ -179,15 +179,26 @@ try {
       await codexReply("What word did you read from canary.txt? Do not reread it. Reply with just it.", "COMPAT_MEMORY_7391");
     });
     service.dispose(); await Promise.allSettled(closing);
-    await step("Codex initialization with configured MCP servers enabled", async () => {
+    await step("Codex configured MCP servers publish tools after thread startup", async () => {
       setCodexMcpEnabled(true);
       const client = new CodexAppServerClient({ cwd: workspace });
       try {
         await client.start(); await client.initialize(); client.notifyInitialized();
+        await client.request("thread/start", {
+          cwd: workspace, model: config.codexModel ?? null,
+          approvalPolicy: "never", sandbox: "danger-full-access", ephemeral: true,
+        }, 120_000);
         const status = await client.request("mcpServerStatus/list", { limit: 100 });
         assert.ok(Array.isArray(status.data));
         const expected = listConfiguredCodexMcpServers();
-        for (const name of expected) assert.ok(status.data.some((server) => server.name === name), `Missing MCP server ${name}`);
+        for (const name of expected) {
+          const server = status.data.find((candidate) => candidate.name === name);
+          assert.ok(server, `Missing MCP server ${name}`);
+          const tools = Object.keys(server.tools ?? {});
+          assert.ok(tools.length > 0 || server.resources?.length > 0 || server.resourceTemplates?.length > 0,
+            `MCP server ${name} has no initialized tools or resources`);
+          console.log(`[compat] MCP ${name}: ${tools.length} tools`);
+        }
         console.log(`[compat] MCP status lists ${status.data.length} servers`);
       } finally { await client.close(); setCodexMcpEnabled(false); }
     });

@@ -8590,7 +8590,7 @@ ${message}`,
 
     session.setReasoningEffort(normalized);
     updateSessionMetadata(contextKey, session);
-    const text = `Reasoning effort set to ${normalized}. It applies from the next turn in this context.`;
+    const text = `Reasoning effort set to ${normalized} for the selected session. Its next turn and /new here use it. Other running sessions keep their effort.`;
     await safeReply(ctx, escapeHTML(text), { fallbackText: text });
     return true;
   };
@@ -8632,11 +8632,11 @@ ${message}`,
       .map((effort) => (effort === current ? `${effort} (selected)` : effort))
       .join(", ");
     const text = current
-      ? `<b>Reasoning effort:</b> <code>${escapeHTML(current)}</code>\n\nLevels: ${escapeHTML(levelList)}\nSend /effort &lt;level&gt; to select for new threads.`
-      : `<b>Reasoning effort:</b> not set (model default)\n\nLevels: ${escapeHTML(levelList)}\nSend /effort &lt;level&gt; to select for new threads.`;
+      ? `<b>Reasoning effort:</b> <code>${escapeHTML(current)}</code>\n\nLevels: ${escapeHTML(levelList)}\nSend /effort &lt;level&gt; to change the selected session's next turn and the default for /new here.`
+      : `<b>Reasoning effort:</b> not set (model default)\n\nLevels: ${escapeHTML(levelList)}\nSend /effort &lt;level&gt; to change the selected session's next turn and the default for /new here.`;
     const plain = current
-      ? `Reasoning effort: ${current}\n\nLevels: ${levelList}\nSend /effort <level> to select for new threads.`
-      : `Reasoning effort: not set (model default)\n\nLevels: ${levelList}\nSend /effort <level> to select for new threads.`;
+      ? `Reasoning effort: ${current}\n\nLevels: ${levelList}\nSend /effort <level> to change the selected session's next turn and the default for /new here.`
+      : `Reasoning effort: not set (model default)\n\nLevels: ${levelList}\nSend /effort <level> to change the selected session's next turn and the default for /new here.`;
     await safeReply(ctx, text, {
       fallbackText: plain,
       replyMarkup: keyboard,
@@ -9165,9 +9165,10 @@ ${message}`,
     pendingEffortButtons.delete(contextKey);
     session.setReasoningEffort(effort);
     updateSessionMetadata(contextKey, session);
-    const html = `⚡ Reasoning effort set to <code>${escapeHTML(effort)}</code> — applies to new threads.`;
+    const plain = `Reasoning effort set to ${effort} for the selected session. Its next turn and /new here use it. Other running sessions keep their effort.`;
+    const html = escapeHTML(plain);
     await safeEditMessage(bot, chatId, messageId, html, {
-      fallbackText: `⚡ Reasoning effort set to ${effort} — applies to new threads.`,
+      fallbackText: plain,
     });
   });
 

@@ -9,6 +9,7 @@ import { AgentSessionManager } from "../src/agent-session-manager.js";
 import type { CodexThreadRecord } from "../src/codex-state.js";
 import type { CodexSessionCallbacks, CodexSessionInfo, CodexThreadGoal, CodexThreadGoalSetParams } from "../src/codex-session.js";
 import type { TeleCodeConfig } from "../src/config.js";
+import type { CodexReasoningEffort } from "../src/reasoning-effort.js";
 import { SessionRegistry } from "../src/session-registry.js";
 import type { SessionSearchHit } from "../src/session-search.js";
 
@@ -42,8 +43,8 @@ vi.mock("../src/session-search.js", () => ({
 
 const runtimes: FakeRuntime[] = [];
 vi.mock("../src/codex-backend.js", () => ({
-  createCodexSession: async (_config: unknown, options?: { resumeThreadId?: string; workspace?: string }) => {
-    const runtime = new FakeRuntime(options?.resumeThreadId ?? null);
+  createCodexSession: async (_config: unknown, options?: { resumeThreadId?: string; workspace?: string; reasoningEffort?: string }) => {
+    const runtime = new FakeRuntime(options?.resumeThreadId ?? null, options?.reasoningEffort as CodexReasoningEffort | undefined);
     runtimes.push(runtime);
     return runtime;
   },
@@ -69,15 +70,17 @@ class FakeRuntime {
   private goalHold = "";
   readonly dispose = vi.fn();
   readonly prompts: string[] = [];
+  readonly promptEfforts: Array<CodexReasoningEffort | undefined> = [];
   callbacks?: CodexSessionCallbacks;
 
-  constructor(public threadId: string | null) {}
+  constructor(public threadId: string | null, public reasoningEffort?: CodexReasoningEffort) {}
 
   getInfo(): CodexSessionInfo {
     return {
       threadId: this.threadId,
       workspace: workspaceDir,
       model: "gpt-5.5",
+      reasoningEffort: this.reasoningEffort,
       launchProfileId: "default",
       launchProfileLabel: "Default",
       launchProfileBehavior: "danger-full-access, never approve",
@@ -182,6 +185,15 @@ class FakeRuntime {
     return [];
   }
 
+  listModels() {
+    return [{ slug: "gpt-5.5", supportedReasoningEfforts: ["medium", "high", "max"] as CodexReasoningEffort[] }];
+  }
+
+  setReasoningEffort(effort: CodexReasoningEffort): void {
+    if (this.processing) throw new Error("Cannot change effort during a turn");
+    this.reasoningEffort = effort;
+  }
+
   listWorkspaces(): string[] {
     return [workspaceDir];
   }
@@ -190,6 +202,7 @@ class FakeRuntime {
     this.callbacks = callbacks;
     const text = (typeof input === "string" ? input : JSON.stringify(input)).match(/(hold \w+|quick \w+)/)?.[1] ?? "?";
     this.prompts.push(text);
+    this.promptEfforts.push(this.reasoningEffort);
     this.processing = true;
     this.kind = "prompt";
     try {
@@ -638,6 +651,39 @@ describe("background Codex turns", () => {
 
     holds.get("hold A")!();
     await waitFor(() => sent.some((text) => /^Background Codex.*, finished after [\s\S]*FINAL hold A/.test(text)));
+  });
+
+  it("isolates parallel efforts and inherits the selected runtime rather than the last background completion", async () => {
+    const { bot, sent, registry } = createHarness();
+    await bot.handleUpdate(textUpdate(1, "/effort max"));
+    await bot.handleUpdate(textUpdate(2, "hold A"));
+    await waitFor(() => holds.has("hold A"));
+    await bot.handleUpdate(textUpdate(3, "/new"));
+    expect(runtimes[1].reasoningEffort).toBe("max");
+    await bot.handleUpdate(textUpdate(4, "/effort medium"));
+    await bot.handleUpdate(textUpdate(5, "hold B"));
+    await waitFor(() => holds.has("hold B"));
+    expect(runtimes[0].promptEfforts).toEqual(["max"]);
+    expect(runtimes[1].promptEfforts).toEqual(["medium"]);
+
+    await bot.handleUpdate(textUpdate(6, "/effort high"));
+    expect(sent.at(-1)).toContain("Cannot change effort while a prompt is running");
+    expect(runtimes[1].reasoningEffort).toBe("medium");
+    await bot.handleUpdate(textUpdate(7, "/use thread-1"));
+    expect(registry.get("123")).toBe(runtimes[0]);
+    await bot.handleUpdate(textUpdate(8, "/new"));
+    expect(runtimes[2].reasoningEffort).toBe("max");
+    await bot.handleUpdate(textUpdate(9, "/effort high"));
+    expect(runtimes.map((runtime) => runtime.reasoningEffort)).toEqual(["max", "medium", "high"]);
+
+    holds.get("hold B")!();
+    await waitFor(() => sent.some((text) => text.includes("FINAL hold B")));
+    holds.get("hold A")!();
+    await waitFor(() => sent.some((text) => text.includes("FINAL hold A")));
+    await waitFor(() => runtimes[0].dispose.mock.calls.length === 1 && runtimes[1].dispose.mock.calls.length === 1);
+    expect(registry.listContexts()[0].reasoningEffort).toBe("high");
+    await bot.handleUpdate(textUpdate(10, "/new"));
+    expect(registry.get("123")?.getInfo().reasoningEffort).toBe("high");
   });
 
   it("moves a running goal to the background and reports it when the goal completes", async () => {

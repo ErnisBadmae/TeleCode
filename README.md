@@ -224,6 +224,8 @@ Spawned Codex subagent threads are omitted from `/sessions` and remain available
 
 Session metadata (thread ID, workspace, launch profile, model, effort, backend, active provider) is persisted to `.telecode/contexts.json` and restored on restart, so threads survive bot reboots. On first startup after upgrading from the legacy TeleCodex naming, a `.telecodex` state directory is migrated automatically; legacy `TELECODEX_*` environment variables remain accepted.
 
+`/effort` changes the selected Codex runtime's next turn and the effort inherited by `/new` in that Telegram context. It is rejected while the selected runtime is working. Parallel background runtimes keep their own effort; selecting a still-running background session restores its runtime and setting. A background completion does not overwrite the selected context's effort.
+
 ## The Claude Code provider
 
 Set `ENABLE_CLAUDE_PROVIDER=true` and run `/claude` in any context. Two engines are available per context via `/backend`:
