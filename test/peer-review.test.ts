@@ -16,12 +16,17 @@ beforeAll(() => {
   workerPath = path.join(workspace, "worker.mjs");
   writeFileSync(workerPath, `
 import {spawn} from "node:child_process";
-import {writeFileSync} from "node:fs";
+import {readFileSync,writeFileSync} from "node:fs";
 import {randomUUID} from "node:crypto";
 import path from "node:path";
 import {guardWorker} from ${JSON.stringify(pathToFileURL(helper).href)};
 process.once("message", (r) => {
   guardWorker(r.timeoutMs);
+  if (r.operation === "models") {
+    const catalogue = JSON.parse(readFileSync(path.join(r.cwd, "models.json"), "utf8"));
+    if (catalogue.hang) r.prompt = "hang";
+    else { process.send({type:"result", result:catalogue}); return; }
+  }
   if (r.prompt === "hang") {
     const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {stdio:"ignore", windowsHide:true});
     writeFileSync(path.join(r.cwd, "pids.json"), JSON.stringify({worker:process.pid, child:child.pid}));
@@ -41,18 +46,45 @@ function request(overrides = {}) {
 }
 function call(raw = request()) { return runPeerReview(raw, { workerPath, receiptRoot }); }
 
-it("lists only the Codex models the account offers, with their efforts", () => {
+it("lists cached Codex offerings alongside a fresh Claude catalogue with per-model efforts", async () => {
   const home = path.join(workspace, "codex-home");
   mkdirSync(home, { recursive: true });
   writeFileSync(path.join(home, "models_cache.json"), JSON.stringify({ fetched_at: "t", models: [
     { slug: "visible-model", display_name: "Visible", visibility: "list", supported_reasoning_levels: [{ effort: "low" }, { effort: "max" }] },
     { slug: "hidden-model", visibility: "hide", supported_reasoning_levels: [] },
   ] }));
-  const listed = listModels(home);
+  const probeOptions = { workerPath, cwd: workspace };
+  const catalogue = { ok: true, fetchedAt: "now", models: [
+    { model: "new-alias", resolvedModel: "new-model-id", efforts: ["low", "max"] },
+    { model: "no-effort", efforts: [] },
+    { model: "unknown-effort", efforts: null },
+  ] };
+  writeFileSync(path.join(workspace, "models.json"), JSON.stringify(catalogue));
+  const listed = await listModels(home, probeOptions);
   expect(listed.codex.models).toEqual([{ model: "visible-model", name: "Visible", efforts: ["low", "max"] }]);
-  expect(listed.claude.models.map((m: { model: string }) => m.model)).toContain("opus");
-  expect(listModels(path.join(workspace, "missing")).codex.error).toMatch(/unreadable/);
+  expect(listed.claude).toEqual({ fetchedAt: catalogue.fetchedAt, models: catalogue.models });
+  writeFileSync(path.join(workspace, "models.json"), JSON.stringify({ ok: true, fetchedAt: "later", models: [{ model: "future-model", efforts: ["medium"] }] }));
+  const refreshed = await listModels(path.join(workspace, "missing"), probeOptions);
+  expect(refreshed.codex.error).toMatch(/unreadable/);
+  expect(refreshed.claude.models).toEqual([{ model: "future-model", efforts: ["medium"] }]);
 });
+
+it("reports model discovery failures without a stale alias fallback and reaps a hung probe", async () => {
+  const modelFile = path.join(workspace, "models.json");
+  writeFileSync(modelFile, JSON.stringify({ ok: false, error: "discovery unavailable" }));
+  const probeOptions = { workerPath, cwd: workspace, timeoutMs: 1500 };
+  expect((await listModels(workspace, probeOptions)).claude).toEqual({ error: "discovery unavailable", models: [] });
+  writeFileSync(modelFile, JSON.stringify({ hang: true }));
+  const pidFile = path.join(workspace, "pids.json");
+  rmSync(pidFile, { force: true });
+  const timedOut = await listModels(workspace, probeOptions);
+  expect(timedOut.claude.error).toMatch(/exceeded/);
+  expect(timedOut.claude.models).toEqual([]);
+  const pids = JSON.parse(readFileSync(pidFile, "utf8"));
+  for (const pid of [pids.worker, pids.child]) {
+    await vi.waitFor(() => expect(() => process.kill(pid, 0)).toThrow(), { timeout: 3000 });
+  }
+}, 10_000);
 
 it("requires caller choices rather than filling them from another session", () => {
   for (const key of ["provider", "model", "effort", "cwd"]) {

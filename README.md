@@ -232,6 +232,8 @@ The optional shared skill in `skills/peer-review` lets Claude request a Codex se
 
 The caller sends JSON to `node skills/peer-review/scripts/peer-review.mjs`, on stdin or through one request-file argument. Required fields are `provider`, `model`, `effort`, `cwd` and `prompt`; optional fields are `resume` and `timeoutMs`. Reviews are read-only and return an answer plus a reviewer session ID for focused follow-ups. The selected Telegram session and its defaults remain unchanged. Small ID markers keep reviewer transcripts outside normal session browsing.
 
+Run the helper with `--models` to read Codex's account model cache and query the installed Claude CLI live for aliases, resolved model IDs and supported effort levels. Claude discovery sends no inference prompt and has a 20-second deadline. Failures remain explicit, without a fixed-list fallback; unreported effort support stays unknown.
+
 Run `node scripts/peer-review-smoke.mjs` for live cross-provider verification. See the skill for invocation details and `docs/roundtable-design.md` for scope.
 
 ## The Claude Code provider

@@ -19,8 +19,8 @@ const reviewRules = "You are a read-only peer reviewer. Inspect the requested ev
 const receiptRoot = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), ".local", "state"), "TeleCode", "peer-reviews");
 
 // Codex keeps the account's model catalogue in models_cache.json; hidden entries are not offered.
-// Claude takes aliases that always resolve to the newest model of each family.
-export function listModels(codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex")) {
+// Claude's installed CLI supplies its live aliases, resolved IDs and capabilities.
+export async function listModels(codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex"), options = {}) {
   let codex;
   try {
     const cache = JSON.parse(readFileSync(path.join(codexHome, "models_cache.json"), "utf8"));
@@ -31,7 +31,15 @@ export function listModels(codexHome = process.env.CODEX_HOME || path.join(os.ho
   } catch (error) {
     codex = { error: `Codex model cache unreadable: ${errorText(error)}`, models: [] };
   }
-  return { codex, claude: { models: ["opus", "sonnet", "haiku", "fable"].map((model) => ({ model, efforts: levels.claude })) } };
+  let claude;
+  try {
+    const result = await runWorker({ operation: "models", cwd: options.cwd ?? path.dirname(self), timeoutMs: options.timeoutMs ?? 20_000 }, options);
+    claude = result.ok ? { fetchedAt: result.fetchedAt, models: result.models }
+      : { error: result.error, models: [] };
+  } catch (error) {
+    claude = { error: errorText(error), models: [] };
+  }
+  return { codex, claude };
 }
 
 export function validateRequest(raw) {
@@ -105,11 +113,22 @@ function errorText(error) {
 export async function stopWorkerTree(worker) {
   if (!worker.pid || worker.exitCode !== null || worker.signalCode !== null) return;
   if (process.platform === "win32") {
-    await new Promise((resolve, reject) => {
+    const code = await new Promise((resolve, reject) => {
       const killer = spawn(path.join(process.env.SystemRoot || "C:\\Windows", "System32", "taskkill.exe"), ["/PID", String(worker.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
       killer.once("error", reject);
-      killer.once("exit", (code) => code === 0 || worker.exitCode !== null ? resolve() : reject(new Error(`Could not stop reviewer process tree (${code}).`)));
+      killer.once("exit", resolve);
     });
+    // The worker's disconnect guard can win the race with this taskkill.
+    // Windows process termination and Node's exit notification are asynchronous.
+    if (code !== 0) {
+      for (let attempt = 0; attempt < 20; attempt++) {
+        if (worker.exitCode !== null || worker.signalCode !== null) return;
+        try { process.kill(worker.pid, 0); }
+        catch (error) { if (error.code === "ESRCH") return; }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      throw new Error(`Could not stop reviewer process tree (${code}).`);
+    }
   } else {
     try { process.kill(-worker.pid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") throw error; }
   }
@@ -126,9 +145,50 @@ export function guardWorker(timeoutMs) {
   timer.unref();
 }
 
+async function runWorker(request, options = {}) {
+  let worker;
+  try {
+    worker = fork(options.workerPath ?? self, ["--worker"], {
+      cwd: request.cwd, env: reviewerEnv(), execArgv: [], windowsHide: true,
+      detached: process.platform !== "win32", stdio: ["ignore", "ignore", "ignore", "ipc"],
+    });
+    const result = await new Promise((resolve) => {
+      let settled = false;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        process.removeListener("SIGINT", cancel);
+        process.removeListener("SIGTERM", cancel);
+        process.removeListener("SIGHUP", cancel);
+        resolve(value);
+      };
+      const cancel = () => finish({ ok: false, error: "Peer command cancelled.", code: "cancelled" });
+      const timer = setTimeout(() => finish({ ok: false, error: `Peer command exceeded ${request.timeoutMs} ms.`, code: "timeout" }), request.timeoutMs);
+      process.once("SIGINT", cancel);
+      process.once("SIGTERM", cancel);
+      process.once("SIGHUP", cancel);
+      worker.once("error", (error) => finish({ ok: false, error: errorText(error), code: "provider_error" }));
+      worker.once("close", (code) => finish({ ok: false, error: `Reviewer worker exited before returning a result (${code}).`, code: "provider_error" }));
+      worker.on("message", (message) => {
+        if (message?.type === "result") finish(message.result);
+        if (message?.type === "session" && options.onSession) {
+          try { options.onSession(message.sessionId); }
+          catch (error) { finish({ ok: false, code: "state_error", error: errorText(error) }); }
+        }
+      });
+      worker.send(request, (error) => { if (error) finish({ ok: false, error: errorText(error), code: "provider_error" }); });
+    });
+    return result;
+  } finally {
+    // Keep the worker alive until its entire tree is reaped, including SDK children.
+    if (worker) await stopWorkerTree(worker);
+  }
+}
+
 export async function runPeerReview(raw, options = {}) {
   let request;
-  let worker;
+  let started = false;
   try {
     request = validateRequest(raw);
     const root = options.receiptRoot ?? receiptRoot;
@@ -148,49 +208,15 @@ export async function runPeerReview(raw, options = {}) {
       request.providerSessionId = randomUUID();
       recordSession(request.providerSessionId);
     }
-    worker = fork(options.workerPath ?? self, ["--worker"], {
-      cwd: request.cwd, env: reviewerEnv(), execArgv: [], windowsHide: true,
-      detached: process.platform !== "win32", stdio: ["ignore", "ignore", "ignore", "ipc"],
-    });
-    const result = await new Promise((resolve) => {
-      let settled = false;
-      const finish = (value) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        process.removeListener("SIGINT", cancel);
-        process.removeListener("SIGTERM", cancel);
-        process.removeListener("SIGHUP", cancel);
-        resolve(value);
-      };
-      const cancel = () => finish({ ok: false, error: "Review cancelled.", code: "cancelled" });
-      const timer = setTimeout(() => finish({ ok: false, error: `Review exceeded ${request.timeoutMs} ms.`, code: "timeout" }), request.timeoutMs);
-      process.once("SIGINT", cancel);
-      process.once("SIGTERM", cancel);
-      process.once("SIGHUP", cancel);
-      worker.once("error", (error) => finish({ ok: false, error: errorText(error), code: "provider_error" }));
-      worker.once("close", (code) => finish({ ok: false, error: `Reviewer worker exited before returning a result (${code}).`, code: "provider_error" }));
-      worker.on("message", (message) => {
-        if (message?.type === "result") finish(message.result);
-        if (message?.type === "session" && !request.resume) {
-          try { recordSession(message.sessionId); }
-          catch (error) { finish({ ok: false, code: "state_error", error: errorText(error) }); }
-        }
-      });
-      worker.send(request, (error) => { if (error) finish({ ok: false, error: errorText(error), code: "provider_error" }); });
-    });
-    // Keep the worker alive until its entire tree is reaped, including SDK children.
-    await stopWorkerTree(worker);
-    worker = undefined;
+    started = true;
+    const result = await runWorker(request, { ...options, onSession: request.resume ? undefined : recordSession });
     if (result.ok) {
       if (!uuid.test(result.sessionId ?? "") || !result.answer?.trim()) throw new Error("Provider returned no answer or reusable session ID.");
       recordSession(result.sessionId, true);
     }
     return { ...result, requested: requested(request) };
   } catch (error) {
-    return { ok: false, code: worker ? "provider_error" : "invalid_request", error: errorText(error), ...(request ? { requested: requested(request) } : {}) };
-  } finally {
-    if (worker) await stopWorkerTree(worker);
+    return { ok: false, code: started ? "provider_error" : "invalid_request", error: errorText(error), ...(request ? { requested: requested(request) } : {}) };
   }
 }
 
@@ -230,6 +256,26 @@ async function runCodex(request) {
   const code = await exit;
   if (code !== 0) return { ...result, ok: false, code: "provider_error", error: errorText(stderr || `Codex exited with ${code}.`) };
   return result;
+}
+
+async function runClaudeModelProbe(request) {
+  const { query } = await import("@anthropic-ai/claude-agent-sdk");
+  let releasePrompt;
+  const held = new Promise((resolve) => { releasePrompt = resolve; });
+  async function* idlePrompt() { await held; }
+  const stream = query({ prompt: idlePrompt(), options: {
+    ...claudeOptions(request, reviewerEnv()), persistSession: false,
+  } });
+  try {
+    const models = await stream.supportedModels();
+    if (!Array.isArray(models) || !models.length || models.some((model) => !model.value)) throw new Error("Claude returned an invalid or empty model catalogue.");
+    return { ok: true, fetchedAt: new Date().toISOString(), models: models.map((model) => ({
+      model: model.value, name: model.displayName ?? model.value,
+      resolvedModel: model.resolvedModel ?? null,
+      supportsEffort: model.supportsEffort ?? null,
+      efforts: model.supportedEffortLevels ?? (model.supportsEffort === false ? [] : null),
+    })) };
+  } finally { stream.close(); releasePrompt(); }
 }
 
 async function runClaude(request) {
@@ -282,16 +328,19 @@ if (process.argv[1] && realpathSync(process.argv[1]) === self) {
     process.once("message", async (request) => {
       guardWorker(request.timeoutMs);
       try {
-        const result = await (request.provider === "codex" ? runCodex(request) : runClaude(request));
+        const result = await (request.operation === "models" ? runClaudeModelProbe(request)
+          : request.provider === "codex" ? runCodex(request) : runClaude(request));
         if (process.connected) process.send({ type: "result", result });
       } catch (error) {
         if (process.connected) process.send({ type: "result", result: { ok: false, code: "provider_error", error: errorText(error) } });
       }
     });
   } else if (process.argv[2] === "--models") {
-    process.stdout.write(`${JSON.stringify(listModels())}\n`);
+    const result = await listModels();
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    process.exitCode = result.codex.error || result.claude.error ? 1 : 0;
   } else if (process.argv[2] === "--help") {
-    console.log('Usage: node <skill>/scripts/peer-review.mjs [request.json]\nJSON: {"provider":"codex|claude","model":"explicit name","effort":"provider-supported level","cwd":"absolute directory","prompt":"question + context","resume":"optional reviewer UUID","timeoutMs":180000}\n--models lists the model names and efforts each provider accepts.\nRead-only. One JSON result. Exit 0 success, 1 failure.');
+    console.log('Usage: node <skill>/scripts/peer-review.mjs [request.json]\nJSON: {"provider":"codex|claude","model":"explicit name","effort":"provider-supported level","cwd":"absolute directory","prompt":"question + context","resume":"optional reviewer UUID","timeoutMs":180000}\n--models reads the Codex account cache and queries Claude live for models and efforts (20-second deadline, no inference prompt).\nRead-only. One JSON result. Exit 0 success, 1 failure.');
   } else {
     let result;
     try {

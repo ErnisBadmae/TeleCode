@@ -13,7 +13,7 @@ Example request:
 {"provider":"claude","model":"sonnet","effort":"high","cwd":"C:\\Users\\Anthony\\codetest\\tools\\TeleCode","prompt":"Independently review skills/peer-review/scripts/peer-review.mjs for process cleanup bugs. Cite file locations and evidence."}
 ```
 
-Never guess a model name. Run `node "<this skill directory>/scripts/peer-review.mjs" --models` first: it prints the Codex models this ChatGPT account offers (from Codex's own model cache) with the efforts each supports, and the Claude aliases. When Anthony names a model loosely, such as "6.1 max", map it to the listed name (`gpt-6.1-sol`, effort `max`) and say which one you picked.
+Never guess a model name. Run `node "<this skill directory>/scripts/peer-review.mjs" --models` first: it reads Codex's account cache and queries the installed Claude CLI live for aliases, resolved model IDs and supported efforts. Claude discovery sends no inference prompt, has a 20-second deadline and never falls back to a fixed list. Each provider includes a `fetchedAt` or `error`; an unknown effort list is null, not verified support. When Anthony names a model loosely, such as "6.1 max", map it to the listed name (`gpt-6.1-sol`, effort `max`) and say which one you picked.
 
 Codex efforts: minimal, low, medium, high, xhigh, max, ultra, persistent. Claude efforts: low, medium, high, xhigh, max. Actual model support varies. Choose a model available on the installed provider; report provider rejection or an applied-setting difference honestly. `applied` values of null mean the provider did not report them, not that the requested values were verified.
 
