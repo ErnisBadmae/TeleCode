@@ -1,6 +1,6 @@
 # Roundtable design: multi-agent collaboration in TeleCode
 
-Status: design only, nothing built. Last updated 2026-09-30.
+Status: roundtable and scoped review features are design only. Background session support is built. Last updated 2026-10-07.
 
 This document captures the design discussion for letting Claude, Codex, and any other provider TeleCode runs work together, on one machine and later across machines through Telegram. Pick up from here. The decisions below were made by the owner (Anthony) and should not be relitigated without him.
 
@@ -17,6 +17,22 @@ Step 1, shared context, is done (2026-09-30). `codetest\AGENTS.md` is the single
 Step 2, the roundtable, is designed below and not built.
 
 There is currently no second machine to pair with. Cross-machine work is future work, so the local roundtable comes first.
+
+## Next feature: scoped cross-provider reviews
+
+Requested by Anthony on 2026-10-07. Backlog item, not implemented. Build this small local review flow before the full roundtable: Claude can ask Codex for a review or second opinion, and Codex can ask Claude, within an explicitly chosen task context.
+
+Proposed user entry point: `/review codex <question>` or `/review claude <question>` from the requesting session. Natural requests such as "ask Claude to review this change" should use the same route. Give each provider a TeleCode `request_review` tool so the agent can request a bounded second opinion directly when Anthony has authorized peer review for the task. This bridge capability should work independently of the browser MCP toggle.
+
+Each request carries a request ID, the originating session and Telegram context, workspace and exact revision, review question, goal and constraints, relevant decisions, and chosen files or diff. Make the context packet inspectable. Use a fresh reviewer by default, with its own model and effort setting. Sending the packet must not change the selected session, steal another running session, or change its model or effort. Broader or existing-session context can be an explicit option later.
+
+The reviewer has read-only access by default. Its response returns to the requesting agent as a tool result with concrete findings, file references or supporting evidence, uncertainties, and any proposed tests. The requesting agent decides what to change and tells Anthony what it accepted or disagreed with. Another agent's suggestion is never human approval. When a review was requested directly through the command, deliver a short provider-labelled result in that same originating context.
+
+Default to one reviewer turn with a deadline and budget. Do not recursively spawn more reviews. Permit one deliberate clarification only within the configured limit. Expose progress, cancellation, failure, and completion through TeleCode's existing job and delivery machinery; keep a record linking the request, context packet, reviewer session, and response. A timeout or unavailable provider must return a clear result to the caller and let its task continue.
+
+Acceptance checks: both Claude-to-Codex and Codex-to-Claude through real CLIs; the requested context and revision are used; the reviewer cannot edit; the answer returns to the correct requesting session after a session switch; unrelated parallel sessions and their efforts are unaffected; narration arrives in order; cancellation, timeout, and unavailable-provider handling settle the request; repeated delivery cannot produce duplicate reviews or recursive loops.
+
+This is a separate next feature after the CLI release hardening. It can reuse the current per-session provider runtimes and background-job routing without depending on Telegram groups, private-chat topics, or a second machine.
 
 ## Decisions already made
 
