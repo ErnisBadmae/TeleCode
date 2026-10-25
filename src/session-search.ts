@@ -1,8 +1,11 @@
 import { existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { promisify } from "node:util";
+import { zstdDecompress } from "node:zlib";
 
 import { OUTPUT_FILES_INSTRUCTION_PREFIX } from "./attachments.js";
+import { bridgeLog } from "./bridge-log.js";
 import { cleanSessionTitle, deriveSessionTitle } from "./bot-ui.js";
 
 export interface SessionSearchHit {
@@ -34,7 +37,10 @@ export interface SessionSearchOptions {
   indexPath: string;
   claudeProjectsDir: string;
   codexSessionsDir: string;
+  codexArchivedSessionsDir?: string;
 }
+
+const zstdDecompressAsync = promisify(zstdDecompress);
 
 /** Per-message and per-session caps keep pathological transcripts from bloating the index. */
 const MAX_MESSAGE_CHARS = 4000;
@@ -229,20 +235,30 @@ export class SessionSearchIndex {
 
   private async runRefresh(): Promise<void> {
     const db = this.ensureDb();
+    const claudeRoots = [this.options.claudeProjectsDir].filter((dir) => dir && existsSync(dir));
+    const codexRoots = [this.options.codexSessionsDir, this.options.codexArchivedSessionsDir ?? ""]
+      .filter((dir) => dir && existsSync(dir));
+    const claudeFiles = claudeRoots.flatMap((dir) => listJsonlFiles(dir, { skipDirNames: new Set(["subagents"]) }));
+    const codexFiles = dropCompressedDuplicates(codexRoots.flatMap((dir) => listJsonlFiles(dir, { allowZst: true })));
     const candidates = [
-      ...listJsonlFiles(this.options.claudeProjectsDir, { skipDirNames: new Set(["subagents"]) })
-        .map((filePath) => ({ filePath, provider: "claude" as const })),
-      ...listJsonlFiles(this.options.codexSessionsDir, {})
-        .map((filePath) => ({ filePath, provider: "codex" as const })),
+      ...claudeFiles.map((filePath) => ({ filePath, provider: "claude" as const })),
+      ...codexFiles.map((filePath) => ({ filePath, provider: "codex" as const })),
     ];
+    // A provider whose directory is missing (unset HOME, unmounted drive) keeps its
+    // rows; only a directory that was actually scanned can prove a file is gone.
+    const scannedProviders = new Set<string>([
+      ...(claudeRoots.length > 0 ? ["claude"] : []),
+      ...(codexRoots.length > 0 ? ["codex"] : []),
+    ]);
 
-    const known = new Map<string, { mtime_ms: number; size: number }>();
-    for (const row of db.prepare("SELECT path, mtime_ms, size FROM files").all() as Array<{
+    const known = new Map<string, { provider: string; mtime_ms: number; size: number }>();
+    for (const row of db.prepare("SELECT path, provider, mtime_ms, size FROM files").all() as Array<{
       path: string;
+      provider: string;
       mtime_ms: number;
       size: number;
     }>) {
-      known.set(row.path, { mtime_ms: row.mtime_ms, size: row.size });
+      known.set(row.path, { provider: row.provider, mtime_ms: row.mtime_ms, size: row.size });
     }
 
     const seen = new Set<string>();
@@ -264,27 +280,38 @@ export class SessionSearchIndex {
       }
     }
 
-    for (const knownPath of known.keys()) {
-      if (!seen.has(knownPath)) {
+    let removed = 0;
+    for (const [knownPath, row] of known) {
+      if (!seen.has(knownPath) && scannedProviders.has(row.provider)) {
         this.removeFile(knownPath);
+        removed += 1;
       }
     }
 
     this.pendingFiles = stale.length;
+    let failed = 0;
     for (const entry of stale) {
       try {
         await this.indexFile(entry);
       } catch (error) {
-        console.warn(
-          `Failed to index session transcript ${entry.filePath}:`,
-          error instanceof Error ? error.message : String(error),
-        );
+        failed += 1;
+        const reason = error instanceof Error ? error.message : String(error);
+        console.warn(`Failed to index session transcript ${entry.filePath}:`, reason);
+        bridgeLog("search", `index failed path=${entry.filePath} error=${reason}`);
       }
       this.pendingFiles -= 1;
       await yieldToEventLoop();
     }
 
     db.prepare("INSERT OR REPLACE INTO meta (key, value) VALUES ('ready', '1')").run();
+    if (stale.length > 0 || removed > 0) {
+      bridgeLog(
+        "search",
+        `refresh claude=${claudeFiles.length} codex=${codexFiles.length} indexed=${stale.length - failed} ` +
+          `failed=${failed} removed=${removed} claudeDir=${claudeRoots.join(";") || "missing"} ` +
+          `codexDirs=${codexRoots.join(";") || "missing"}`,
+      );
+    }
   }
 
   private removeFile(filePath: string): void {
@@ -299,7 +326,8 @@ export class SessionSearchIndex {
     mtimeMs: number;
     size: number;
   }): Promise<void> {
-    const raw = await readFile(entry.filePath, "utf8");
+    const bytes = await readFile(entry.filePath);
+    const raw = (entry.filePath.endsWith(".zst") ? await zstdDecompressAsync(bytes) : bytes).toString("utf8");
     const extracted = entry.provider === "claude"
       ? extractClaudeSession(raw, entry.filePath)
       : extractCodexSession(raw, entry.filePath);
@@ -510,7 +538,7 @@ function looksLikeCommandWrapper(text: string): boolean {
 }
 
 function sessionIdFromRolloutFilename(filePath: string): string {
-  const base = path.basename(filePath, ".jsonl");
+  const base = path.basename(filePath).replace(/\.jsonl(?:\.zst)?$/, "");
   const uuid = base.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
   return uuid?.[0] ?? base;
 }
@@ -588,7 +616,16 @@ export function buildFtsQuery(query: string): string {
   return terms.map((term) => `"${term}"*`).join(" ");
 }
 
-function listJsonlFiles(dir: string, options: { skipDirNames?: Set<string> }): string[] {
+/**
+ * Codex writes `x.jsonl.zst` before deleting `x.jsonl`, so a scan can see both.
+ * The plain file is the one still being appended to.
+ */
+function dropCompressedDuplicates(files: string[]): string[] {
+  const plain = new Set(files.filter((file) => file.endsWith(".jsonl")));
+  return files.filter((file) => !file.endsWith(".zst") || !plain.has(file.slice(0, -".zst".length)));
+}
+
+function listJsonlFiles(dir: string, options: { skipDirNames?: Set<string>; allowZst?: boolean }): string[] {
   if (!dir || !existsSync(dir)) {
     return [];
   }
@@ -606,7 +643,7 @@ function listJsonlFiles(dir: string, options: { skipDirNames?: Set<string> }): s
         if (!options.skipDirNames?.has(entry.name.toLowerCase())) {
           visit(fullPath);
         }
-      } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+      } else if (entry.isFile() && (entry.name.endsWith(".jsonl") || (options.allowZst && entry.name.endsWith(".jsonl.zst")))) {
         results.push(fullPath);
       }
     }

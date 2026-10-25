@@ -1,5 +1,7 @@
 import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
+import { zstdDecompressSync } from "node:zlib";
 
 import { isCodexReasoningEffort, type CodexReasoningEffort } from "./reasoning-effort.js";
 import { getPeerReviewSessionIds } from "./peer-review-sessions.js";
@@ -295,7 +297,7 @@ export function readThreadHistory(threadId: string, limit = 10): CodexHistoryMes
 
   const messages: CodexHistoryMessage[] = [];
   try {
-    const lines = readFileSync(sessionPath, "utf8").split(/\r?\n/);
+    const lines = readRolloutTextSync(sessionPath).split(/\r?\n/);
     for (const line of lines) {
       if (!line.trim()) {
         continue;
@@ -636,8 +638,16 @@ function withDatabase<T>(fn: (db: DatabaseInstance) => T): T | null {
   }
 }
 
+/**
+ * CODEX_HOME first, as Codex itself resolves it. Windows does not set HOME, so a
+ * bridge launched outside Git Bash must still fall back to the user profile.
+ */
 function getCodexDir(): string | null {
-  const home = process.env.HOME?.trim();
+  const codexHome = process.env.CODEX_HOME?.trim();
+  if (codexHome) {
+    return codexHome;
+  }
+  const home = process.env.HOME?.trim() || homedir();
   return home ? path.join(home, ".codex") : null;
 }
 
@@ -645,6 +655,22 @@ function getCodexDir(): string | null {
 export function getCodexSessionsDirPath(): string | null {
   const codexDir = getCodexDir();
   return codexDir ? path.join(codexDir, "sessions") : null;
+}
+
+/** Rollouts Codex moved out of `sessions` when a thread was archived. */
+export function getCodexArchivedSessionsDirPath(): string | null {
+  const codexDir = getCodexDir();
+  return codexDir ? path.join(codexDir, "archived_sessions") : null;
+}
+
+/** Codex compresses older rollouts to `.jsonl.zst`; both forms hold the same jsonl. */
+export function isRolloutFile(filePath: string): boolean {
+  return filePath.endsWith(".jsonl") || filePath.endsWith(".jsonl.zst");
+}
+
+export function readRolloutTextSync(filePath: string): string {
+  const raw = readFileSync(filePath);
+  return (filePath.endsWith(".zst") ? zstdDecompressSync(raw) : raw).toString("utf8");
 }
 
 function getModelsCachePath(): string | null {
@@ -658,14 +684,14 @@ function findThreadSessionFile(threadId: string): string | null {
     return null;
   }
 
-  const sessionsDir = path.join(codexDir, "sessions");
-  if (!existsSync(sessionsDir)) {
-    return null;
-  }
+  const roots = [
+    path.join(codexDir, "sessions"),
+    path.join(codexDir, "archived_sessions"),
+  ].filter((directory) => existsSync(directory));
 
   try {
-    const files = walkFiles(sessionsDir)
-      .filter((file) => file.endsWith(".jsonl") && path.basename(file).includes(threadId))
+    const files = roots.flatMap((root) => walkFiles(root))
+      .filter((file) => isRolloutFile(file) && path.basename(file).includes(threadId))
       .map((file) => ({ file, modifiedAtMs: statSync(file).mtimeMs }))
       .sort((left, right) => right.modifiedAtMs - left.modifiedAtMs);
     return files[0]?.file ?? null;

@@ -71,6 +71,7 @@ import {
   formatLaunchProfileLabel,
 } from "./codex-launch.js";
 import {
+  getCodexArchivedSessionsDirPath,
   getCodexSessionsDirPath,
   getParentThread,
   getThread,
@@ -454,6 +455,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         : path.join(config.claudeConfigDir, "projects"))
       : "",
     codexSessionsDir: getCodexSessionsDirPath() ?? "",
+    codexArchivedSessionsDir: getCodexArchivedSessionsDirPath() ?? "",
   });
 
   // The provider state is the authoritative pointer for the Claude conversation

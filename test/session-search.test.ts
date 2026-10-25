@@ -1,6 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { zstdCompressSync } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
@@ -50,6 +51,7 @@ describe("session search index", () => {
 
   const claudeDir = () => path.join(root, "claude-projects");
   const codexDir = () => path.join(root, "codex-sessions");
+  const archivedDir = () => path.join(root, "codex-archived");
 
   beforeEach(() => {
     root = mkdtempSync(path.join(tmpdir(), "telecode-search-"));
@@ -59,6 +61,7 @@ describe("session search index", () => {
       indexPath: path.join(root, "state", "session-index.sqlite"),
       claudeProjectsDir: claudeDir(),
       codexSessionsDir: codexDir(),
+      codexArchivedSessionsDir: archivedDir(),
     });
   });
 
@@ -135,6 +138,50 @@ describe("session search index", () => {
     expect(result.hits[0]!.title).not.toContain("Output files");
     expect(index!.search("instructions ignore").totalMatches).toBe(0);
     expect(index!.search("plugins installed").totalMatches).toBe(0);
+  });
+
+  it("indexes zstd-compressed and archived Codex rollouts", async () => {
+    const id = "aaaa9999-8888-7777-6666-555555555555";
+    writeFileSync(
+      path.join(codexDir(), "2026", "07", `rollout-2026-07-01T10-00-00-${id}.jsonl.zst`),
+      zstdCompressSync(Buffer.from([
+        codexMetaLine(id, "C:\\ws"),
+        codexMessageLine("user", "Did Hermoso fix the blank Instagram messages"),
+      ].join("\n"))),
+    );
+    mkdirSync(path.join(archivedDir(), "2026"), { recursive: true });
+    writeFileSync(
+      path.join(archivedDir(), "2026", "rollout-2026-06-01T10-00-00-bbbb9999-8888-7777-6666-555555555555.jsonl.zst"),
+      zstdCompressSync(Buffer.from(codexMessageLine("user", "archived chat about saxophones"))),
+    );
+
+    await index!.refresh();
+    expect(index!.search("hermoso blank").hits[0]).toMatchObject({ provider: "codex", sessionId: id });
+    expect(index!.search("saxophones").hits[0]).toMatchObject({
+      sessionId: "bbbb9999-8888-7777-6666-555555555555",
+    });
+  });
+
+  it("indexes only the plain rollout while Codex is mid-compression", async () => {
+    const base = path.join(codexDir(), "2026", "07", "rollout-2026-07-01T10-00-00-cccc9999-8888-7777-6666-555555555555.jsonl");
+    writeFileSync(base, codexMessageLine("user", "duplicate check about marimbas"));
+    writeFileSync(`${base}.zst`, zstdCompressSync(Buffer.from(codexMessageLine("user", "duplicate check about marimbas"))));
+
+    await index!.refresh();
+    expect(index!.search("marimbas").totalMatches).toBe(1);
+  });
+
+  it("keeps a provider's rows when its directory is missing", async () => {
+    writeFileSync(
+      path.join(codexDir(), "2026", "07", "rollout-2026-07-01T10-00-00-dddd9999-8888-7777-6666-555555555555.jsonl"),
+      codexMessageLine("user", "session about theremins"),
+    );
+    await index!.refresh();
+    expect(index!.search("theremins").totalMatches).toBe(1);
+
+    rmSync(codexDir(), { recursive: true, force: true });
+    await index!.refresh();
+    expect(index!.search("theremins").totalMatches).toBe(1);
   });
 
   it("picks up changes to an already indexed transcript", async () => {

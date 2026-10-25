@@ -1,3 +1,4 @@
+import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -33,6 +34,7 @@ type LoadOptions = {
 };
 
 const originalHome = process.env.HOME;
+const originalCodexHome = process.env.CODEX_HOME;
 
 afterEach(() => {
   vi.doUnmock("node:fs");
@@ -45,6 +47,11 @@ afterEach(() => {
   } else {
     process.env.HOME = originalHome;
   }
+  if (originalCodexHome === undefined) {
+    delete process.env.CODEX_HOME;
+  } else {
+    process.env.CODEX_HOME = originalCodexHome;
+  }
 });
 
 async function loadCodexState(options: LoadOptions = {}) {
@@ -56,6 +63,7 @@ async function loadCodexState(options: LoadOptions = {}) {
   const threads = options.threads ?? [];
   const spawnEdges = options.spawnEdges ?? [];
   process.env.HOME = home;
+  delete process.env.CODEX_HOME;
 
   vi.resetModules();
   vi.doMock("../src/peer-review-sessions.js", () => ({
@@ -227,6 +235,19 @@ function runGetQuery(
 }
 
 describe("codex-state", () => {
+  it("resolves the Codex dir from CODEX_HOME, then HOME, then the user profile", async () => {
+    const state = await loadCodexState({ files: [] });
+    expect(state.getCodexSessionsDirPath()).toBe(path.join("/Users/tester", ".codex", "sessions"));
+
+    process.env.CODEX_HOME = "/custom/codex";
+    expect(state.getCodexSessionsDirPath()).toBe(path.join("/custom/codex", "sessions"));
+    expect(state.getCodexArchivedSessionsDirPath()).toBe(path.join("/custom/codex", "archived_sessions"));
+
+    delete process.env.CODEX_HOME;
+    delete process.env.HOME;
+    expect(state.getCodexSessionsDirPath()).toBe(path.join(os.homedir(), ".codex", "sessions"));
+  });
+
   it("findLatestDatabase returns null when no sqlite files exist", async () => {
     const state = await loadCodexState({ files: [] });
 
