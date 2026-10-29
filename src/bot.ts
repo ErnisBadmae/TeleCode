@@ -94,6 +94,7 @@ import {
 } from "./providers/claude-state.js";
 import { findTranscript } from "./providers/claude-transcript.js";
 import type { AgentProviderEvent, AgentProviderKind, AgentSessionDescriptor } from "./providers/types.js";
+import { isAddressedToSomeoneElse } from "./group-addressing.js";
 import { createSessionSearchIndex, type SessionSearchHit } from "./session-search.js";
 import { SessionRegistry } from "./session-registry.js";
 import { findRunningClaudeTelegramPluginProcesses } from "./startup-safety.js";
@@ -4055,9 +4056,15 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     if (!fromId || !config.telegramAllowedUserIdSet.has(fromId)) {
       if (ctx.callbackQuery) {
         await ctx.answerCallbackQuery({ text: "Unauthorized" }).catch(() => {});
-      } else if (ctx.chat) {
+      } else if (ctx.chat?.type === "private") {
+        // In groups other members are expected; answering each of them is noise.
         await safeReply(ctx, escapeHTML("Unauthorized"), { fallbackText: "Unauthorized" });
       }
+      return;
+    }
+
+    if (isAddressedToSomeoneElse(ctx.message, ctx.me)) {
+      bridgeLog("intake", "group message addressed to another member; ignored");
       return;
     }
 
