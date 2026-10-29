@@ -93,7 +93,20 @@ import {
   type ClaudeSessionStateRecord,
 } from "./providers/claude-state.js";
 import { findTranscript } from "./providers/claude-transcript.js";
-import type { AgentProviderEvent, AgentProviderKind, AgentSessionDescriptor } from "./providers/types.js";
+import type {
+  AgentPermissionDecision,
+  AgentPermissionRequest,
+  AgentProviderEvent,
+  AgentProviderKind,
+  AgentSessionDescriptor,
+} from "./providers/types.js";
+import {
+  CLAUDE_PERMISSION_CALLBACK,
+  formatPermissionOutcome,
+  formatPermissionPrompt,
+  permissionCallbackData,
+  PermissionPromptRegistry,
+} from "./claude-permission-prompt.js";
 import { createSessionSearchIndex, type SessionSearchHit } from "./session-search.js";
 import { SessionRegistry } from "./session-registry.js";
 import { findRunningClaudeTelegramPluginProcesses } from "./startup-safety.js";
@@ -121,6 +134,7 @@ const FORMATTED_CHUNK_TARGET = 3600;
 const MAX_AUDIO_FILE_SIZE = 25 * 1024 * 1024;
 const KEYBOARD_PAGE_SIZE = 6;
 const CLAUDE_LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
+const CLAUDE_PERMISSION_TIMEOUT_MINUTES = 15;
 const ANSI_PATTERN = /\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]|\r/g;
 // A 50-entry default overflows one Telegram message and pushes the list footer
 // into a second chunk. Keep the default inside a single message; `/sessions all`
@@ -354,6 +368,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
   const pendingUnsafeLaunchConfirmations = new Map<TelegramContextKey, string>();
   const pendingModelButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingEffortButtons = new Map<TelegramContextKey, KeyboardItem[]>();
+  const claudePermissionPrompts = new PermissionPromptRegistry(CLAUDE_PERMISSION_TIMEOUT_MINUTES * 60 * 1000);
   const inspectedThreads = new Map<TelegramContextKey, { threadId: string; parentThreadId?: string }>();
   const lastPromptInput = new Map<TelegramContextKey, CodexPromptInput>();
   const lastAssistantReplyBySessionId = new Map<string, string>();
@@ -2916,10 +2931,42 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         await ensureOutDir(claudeArtifactOutDir);
         promptText = `${text}\n\n${outputFilesInstruction(claudeArtifactOutDir)}`;
       }
+      const askClaudePermission = (request: AgentPermissionRequest): Promise<AgentPermissionDecision> => {
+        const prompt = formatPermissionPrompt(request);
+        let promptMessageId: number | undefined;
+        return claudePermissionPrompts.request(
+          request,
+          async (id) => {
+            const keyboard = new InlineKeyboard()
+              .text("✅ Allow", permissionCallbackData("a", id))
+              .text("❌ Deny", permissionCallbackData("d", id));
+            if (request.canAllowAlways) {
+              keyboard.row().text("♾ Always allow", permissionCallbackData("s", id));
+            }
+            const sent = await sendTextMessage(bot.api, source.chatId, prompt.html, {
+              fallbackText: prompt.plain,
+              replyMarkup: keyboard,
+              messageThreadId,
+            });
+            promptMessageId = sent.message_id;
+          },
+          async (decision, reason) => {
+            if (promptMessageId === undefined) {
+              return;
+            }
+            const outcome = formatPermissionOutcome(decision, reason, CLAUDE_PERMISSION_TIMEOUT_MINUTES);
+            // Editing without reply_markup also removes the buttons.
+            await safeEditMessage(bot, source.chatId, promptMessageId, `${prompt.html}\n\n${escapeHTML(outcome)}`, {
+              fallbackText: `${prompt.plain}\n\n${outcome}`,
+            });
+          },
+        );
+      };
       for await (const event of claudeAdapter.sendPrompt({
         sessionId: descriptor.id,
         jobId,
         input: { text: promptText },
+        onPermissionRequest: askClaudePermission,
       })) {
         switch (event.type) {
           case "assistant_text_delta": {
@@ -7155,6 +7202,18 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
   );
   handlePageCallback(/^model_page_(\d+)$/, "model", pendingModelButtons, "Expired, run /model again");
   handlePageCallback(/^effort_page_(\d+)$/, "effort", pendingEffortButtons, "Expired, run /effort again");
+
+  bot.callbackQuery(CLAUDE_PERMISSION_CALLBACK, async (ctx) => {
+    const decision = claudePermissionPrompts.answer(ctx.match?.[2] ?? "", ctx.match?.[1] ?? "");
+    if (!decision) {
+      // Answered, expired, or lost in a bot restart: drop the stale buttons.
+      await ctx.answerCallbackQuery({ text: "This request is no longer pending" });
+      await ctx.editMessageReplyMarkup().catch(() => {});
+      return;
+    }
+    const toast = decision === "deny" ? "Denied" : decision === "allow_always" ? "Always allowed" : "Allowed";
+    await ctx.answerCallbackQuery({ text: toast });
+  });
 
   bot.callbackQuery(/^codex_abort:(.+)$/, async (ctx) => {
     const contextKey = ctx.match?.[1];

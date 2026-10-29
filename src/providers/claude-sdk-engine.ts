@@ -1,6 +1,6 @@
 import { bridgeLog } from "../bridge-log.js";
 import type { ClaudePermissionMode } from "../config.js";
-import type { AgentProviderEvent } from "./types.js";
+import type { AgentPermissionDecision, AgentPermissionRequest, AgentProviderEvent } from "./types.js";
 
 /**
  * Agent SDK turn runner — the D3 fix. The SDK streams EVERY assistant message
@@ -36,6 +36,11 @@ export interface ClaudeSdkTurnOptions {
   quietStatusIntervalMs?: number;
   /** Effective window Claude Code uses when deciding when to auto-compact. */
   autoCompactWindow?: number;
+  /**
+   * Asks the user about tool calls outside the allow rules. Without it the SDK
+   * auto-denies them, because the bridge has no terminal to prompt in.
+   */
+  onPermissionRequest?: (request: AgentPermissionRequest) => Promise<AgentPermissionDecision>;
   /** Injectable for tests; defaults to the real SDK query(). */
   queryFn?: (input: {
     prompt: string | AsyncIterable<SdkUserMessageLike>;
@@ -596,6 +601,7 @@ function buildSdkQueryOptions(options: {
   forkSession?: boolean;
   abortController?: AbortController;
   autoCompactWindow?: number;
+  onPermissionRequest?: ClaudeSdkTurnOptions["onPermissionRequest"];
 }): Record<string, unknown> {
   return {
     cwd: options.cwd,
@@ -613,6 +619,56 @@ function buildSdkQueryOptions(options: {
     ...(options.resume ? { resume: options.resume } : {}),
     ...(options.forkSession ? { forkSession: true } : {}),
     ...(options.abortController ? { abortController: options.abortController } : {}),
+    ...(options.onPermissionRequest ? { canUseTool: sdkCanUseTool(options.onPermissionRequest) } : {}),
+  };
+}
+
+interface SdkCanUseToolOptions {
+  signal: AbortSignal;
+  suggestions?: unknown[];
+  blockedPath?: string;
+  decisionReason?: string;
+  title?: string;
+  description?: string;
+  toolUseID: string;
+}
+
+type SdkPermissionResult =
+  | { behavior: "allow"; updatedInput: Record<string, unknown>; updatedPermissions?: unknown[]; toolUseID: string }
+  | { behavior: "deny"; message: string; toolUseID: string };
+
+export function sdkCanUseTool(
+  onPermissionRequest: NonNullable<ClaudeSdkTurnOptions["onPermissionRequest"]>,
+): (toolName: string, input: Record<string, unknown>, options: SdkCanUseToolOptions) => Promise<SdkPermissionResult> {
+  return async (toolName, input, options) => {
+    const suggestions = options.suggestions ?? [];
+    let decision: AgentPermissionDecision;
+    try {
+      decision = await onPermissionRequest({
+        toolName,
+        input,
+        title: options.title,
+        description: options.description,
+        decisionReason: options.decisionReason,
+        blockedPath: options.blockedPath,
+        canAllowAlways: suggestions.length > 0,
+        signal: options.signal,
+      });
+    } catch (error) {
+      bridgeLog("permission", `permission request failed tool=${toolName}: ${String(error)}`);
+      decision = "deny";
+    }
+    bridgeLog("permission", `tool=${toolName} decision=${decision}`);
+    if (decision === "deny") {
+      return { behavior: "deny", message: "The user denied this action in Telegram.", toolUseID: options.toolUseID };
+    }
+    return {
+      behavior: "allow",
+      updatedInput: input,
+      // The SDK's own "don't ask again" rules, same as the terminal prompt offers.
+      ...(decision === "allow_always" && suggestions.length > 0 ? { updatedPermissions: suggestions } : {}),
+      toolUseID: options.toolUseID,
+    };
   };
 }
 
