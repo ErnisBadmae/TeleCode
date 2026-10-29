@@ -99,6 +99,7 @@ import { SessionRegistry } from "./session-registry.js";
 import { findRunningClaudeTelegramPluginProcesses } from "./startup-safety.js";
 import { mergeLiveAppServerRateLimits, readLatestCodexUsage, renderUsagePlain } from "./usage.js";
 import { getAvailableBackends, transcribeAudio } from "./voice.js";
+import { extractVoiceBlock, synthesizeVoice, VOICE_REPLY_INSTRUCTION, voiceReplyConfigFromEnv } from "./voice-reply.js";
 import { normalizePersistedWorkspace } from "./workspace-normalization.js";
 
 const TELEGRAM_MESSAGE_LIMIT = 4000;
@@ -354,6 +355,10 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
   const pendingUnsafeLaunchConfirmations = new Map<TelegramContextKey, string>();
   const pendingModelButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingEffortButtons = new Map<TelegramContextKey, KeyboardItem[]>();
+  const voiceReplyConfig = voiceReplyConfigFromEnv();
+  // Without a TTS endpoint the agent is never asked for a <voice> block, so none is stripped.
+  const splitVoiceReply = (text: string): { text: string; voice?: string } =>
+    voiceReplyConfig ? extractVoiceBlock(text) : { text };
   const inspectedThreads = new Map<TelegramContextKey, { threadId: string; parentThreadId?: string }>();
   const lastPromptInput = new Map<TelegramContextKey, CodexPromptInput>();
   const lastAssistantReplyBySessionId = new Map<string, string>();
@@ -2137,9 +2142,11 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       const finalSourceText = finalAnswerText.trim() ? finalAnswerText : pendingStreamText;
       const rememberedText = finalAnswerText.trim() ? finalAnswerText : accumulatedText;
       if (codexAgentSession) {
-        lastAssistantReplyBySessionId.set(codexAgentSession.id, buildFinalResponseText(rememberedText));
+        lastAssistantReplyBySessionId.set(codexAgentSession.id, splitVoiceReply(buildFinalResponseText(rememberedText)).text);
       }
-      const finalUndeliveredText = buildFinalResponseText(finalSourceText);
+      // The spoken version rides at the end of the answer; it goes out as a voice note.
+      const spoken = splitVoiceReply(buildFinalResponseText(finalSourceText));
+      const finalUndeliveredText = spoken.text;
       if (finalUndeliveredText) {
         pendingStreamText = "";
         finalAnswerText = "";
@@ -2155,6 +2162,10 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         }
         await deliverFinalMarkdown(finalUndeliveredText, "final", true);
         sentResponseText = true;
+        if (spoken.voice && isCodexForeground()) {
+          // Not awaited: the text answer is already out and the lane need not wait for TTS.
+          void sendVoiceReply(chatId, messageThreadId, spoken.voice);
+        }
       }
 
       if (!sentResponseText) {
@@ -2590,6 +2601,27 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
         }
       }
     })();
+  };
+
+  const sendVoiceReply = async (
+    chatId: TelegramChatId,
+    messageThreadId: number | undefined,
+    spokenText: string,
+  ): Promise<void> => {
+    const threadOptions = messageThreadId ? { message_thread_id: messageThreadId } : {};
+    try {
+      await bot.api.sendChatAction(chatId, "record_voice", threadOptions).catch(() => {});
+      if (!voiceReplyConfig) {
+        return;
+      }
+      const audio = await synthesizeVoice(voiceReplyConfig, spokenText);
+      await bot.api.sendVoice(chatId, new InputFile(audio, "reply.ogg"), threadOptions);
+    } catch (error) {
+      console.error("Voice reply failed:", error);
+      const message = `Voice reply failed: ${friendlyErrorText(error)}`;
+      await sendTextMessage(bot.api, chatId, escapeHTML(message), { fallbackText: message, messageThreadId })
+        .catch(() => {});
+    }
   };
 
   const handleClaudePrompt = async (
@@ -3033,6 +3065,11 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       }
 
       finalText = finalText.trim() || (sentAssistantProgress ? "" : streamedText.trim());
+      // The spoken version rides at the end of the answer; it goes out as a voice note.
+      const spoken = splitVoiceReply(finalText);
+      const voiceReply = spoken.voice;
+      finalText = spoken.text;
+      finalAssistantBlock = splitVoiceReply(finalAssistantBlock).text;
       if (finalText && claudeAgentSession) {
         lastAssistantReplyBySessionId.set(claudeAgentSession.id, finalText);
       }
@@ -3088,6 +3125,10 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       }
       if (descriptor && finalDelivered) {
         clearDeliveredCompletionFromBuffer(claudeAgentSession?.id ?? descriptor.id, finalTextToDeliver);
+      }
+      if (voiceReply && finalDelivered && isProviderForeground(contextKey, "claude")) {
+        // Not awaited: the text answer is already out and the lane need not wait for TTS.
+        void sendVoiceReply(source.chatId, messageThreadId, voiceReply);
       }
       if (descriptor) {
         persistClaudeSession(contextKey, descriptor);
@@ -7700,6 +7741,10 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     if (keptAudioPath) {
       const hint = degenerateTranscriptHint(transcript);
       promptText += `\n\n[Voice message audio saved at: ${keptAudioPath}${hint ? `. ${hint}` : ""}]`;
+    }
+    if (voiceReplyConfig) {
+      // Both lanes strip a trailing <voice> block from the final answer and send it as a voice note.
+      promptText += `\n\n${VOICE_REPLY_INSTRUCTION}`;
     }
 
     lastPromptInput.set(contextKey, transcript);
