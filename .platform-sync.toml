@@ -1,0 +1,10 @@
+# Managed by platform-devkit (`platform-sync`). Do not edit by hand.
+# Drift is verified by sha256 of the rendered content, not this file's mtime.
+platform_version = "0.1.0"
+
+[[managed]]
+path = ".claude/rules/simplicity.md"
+source = "claude/rules/simplicity.md"
+version = "0.1.0"
+sha256 = "fa92fc57a440249b08c3b9a42d0a3ad589af382b35c834c62ae0ba2c661a269e"
+mode = "managed"

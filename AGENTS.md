@@ -17,6 +17,8 @@ Use Node.js 22+.
 ## Coding Style & Naming Conventions
 This repository uses strict TypeScript with ES modules. Follow the existing style: 2-space indentation, double quotes, semicolons, and explicit `.js` import specifiers in TypeScript source. Prefer small, focused modules and descriptive camelCase identifiers; use PascalCase for exported types and classes, such as `TeleCodeConfig` and `CodexSessionService`.
 
+Design rule: `.claude/rules/simplicity.md` (managed by `platform-sync`, do not edit by hand) — reuse existing helpers and services before writing new code, no options or abstractions nobody asked for.
+
 Keep environment variable names uppercase with underscores, for example `CODEX_APPROVAL_POLICY`. Match new filenames to the current pattern: lowercase kebab-free names in `src/`, and `*.test.ts` in `test/`.
 
 ## Testing Guidelines
