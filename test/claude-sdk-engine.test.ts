@@ -127,7 +127,7 @@ describe("claude sdk engine", () => {
     expect(options.resume).toBe("prior-session");
     expect(options.forkSession).toBeUndefined();
     expect(options.strictMcpConfig).toBe(true);
-    expect(options.settingSources).toEqual(["user", "project"]);
+    expect(options.settingSources).toEqual(["user", "project", "local"]);
     expect(options.systemPrompt).toEqual({ type: "preset", preset: "claude_code" });
     expect(options.pathToClaudeCodeExecutable).toBe("C:\\claude.exe");
     expect((options.env as Record<string, unknown>).TELEGRAM_BOT_TOKEN).toBeUndefined();

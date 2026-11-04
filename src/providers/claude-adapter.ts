@@ -200,7 +200,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
 
     try {
       if (runtime.backend === "sdk") {
-        yield* this.sendPromptViaSdk(runtime, promptText, options.jobId);
+        yield* this.sendPromptViaSdk(runtime, promptText, options.jobId, options.onPermissionRequest);
         return;
       }
       const startupEvents: AgentProviderEvent[] = [];
@@ -450,6 +450,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
     runtime: RuntimeSession,
     promptText: string,
     jobId: string,
+    onPermissionRequest?: AgentSendPromptOptions["onPermissionRequest"],
   ): AsyncIterable<AgentProviderEvent> {
     // A PTY left over from a backend switch is disposed lazily here, never mid-turn.
     if (runtime.pty) {
@@ -487,6 +488,7 @@ export class ClaudeProviderAdapter implements AgentProviderAdapter {
         inputController,
         quietStatusIntervalMs: this.config.claudeTurnIdleTimeoutSeconds * 1000,
         autoCompactWindow: this.config.claudeAutoCompactWindow,
+        onPermissionRequest,
         onProviderSessionId: (providerSessionId) => {
           runtime.forkSourceSessionId = undefined;
           if (runtime.descriptor.metadata?.forkSourceSessionId) {

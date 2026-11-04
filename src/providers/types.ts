@@ -54,11 +54,29 @@ export interface AgentPromptInput {
   metadata?: Record<string, unknown>;
 }
 
+export interface AgentPermissionRequest {
+  toolName: string;
+  input: Record<string, unknown>;
+  /** Provider-rendered prompt sentence, e.g. "Claude wants to run ...". */
+  title?: string;
+  description?: string;
+  decisionReason?: string;
+  blockedPath?: string;
+  /** True when the provider offered rules that stop this prompt from recurring. */
+  canAllowAlways: boolean;
+  /** Aborted when the turn ends before the user answers. */
+  signal: AbortSignal;
+}
+
+export type AgentPermissionDecision = "allow" | "allow_always" | "deny";
+
 export interface AgentSendPromptOptions {
   sessionId: string;
   jobId: string;
   input: AgentPromptInput;
   abortSignal?: AbortSignal;
+  /** Asks the user about a tool call outside the allow rules; absent means deny. */
+  onPermissionRequest?: (request: AgentPermissionRequest) => Promise<AgentPermissionDecision>;
 }
 
 export type AgentProviderEvent =
