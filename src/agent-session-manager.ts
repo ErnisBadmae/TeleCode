@@ -136,7 +136,7 @@ export class AgentSessionManager {
 
     this.sessions.set(sessionId, session);
     lane.sessionIds.push(sessionId);
-    if (options.select !== false || !lane.selectedSessionId) {
+    if (options.select !== false) {
       lane.selectedSessionId = sessionId;
     }
     lane.updatedAt = timestamp;

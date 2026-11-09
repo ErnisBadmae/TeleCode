@@ -187,7 +187,7 @@ vi.mock("../src/providers/claude-adapter.js", async () => {
       if (providerSessionId) {
         mockClaude.setActiveProviderSessionId(providerSessionId);
       }
-      mockClaude.resumeSession(session);
+      await mockClaude.resumeSession(session);
       return session;
     }
 
@@ -1043,6 +1043,44 @@ describe("Claude bot flow", () => {
 
     const selection = sent.map((entry) => entry.text).find((text) => text?.includes("Selected #1"));
     expect(selection).toBeDefined();
+  });
+
+  it("keeps the previous choice on failed Claude resume and shows resume details on success", async () => {
+    const sessionId = "33333333-3333-4333-8333-333333333333";
+    const transcriptDir = path.join(tempDir, ".claude-config", "projects", "project");
+    mkdirSync(transcriptDir, { recursive: true });
+    writeFileSync(
+      path.join(transcriptDir, `${sessionId}.jsonl`),
+      JSON.stringify({ type: "user", cwd: tempDir, message: { content: "Terminal work" } }),
+      "utf8",
+    );
+    const { bot, sent, registry } = await createTestBot(tempDir, { claudeStrictMcpConfig: false });
+    const statePath = path.join(tempDir, ".telecode", "agent-sessions.json");
+    const selected = () => {
+      const state = JSON.parse(readFileSync(statePath, "utf8")) as {
+        lanes: Array<{ laneKey: string; selectedSessionId?: string }>;
+      };
+      return state.lanes[0];
+    };
+
+    await bot.handleUpdate(textUpdate(1, "/sessions"));
+    const previousSelected = selected()?.selectedSessionId;
+    mockClaude.resumeSession.mockRejectedValueOnce(new Error("resume unavailable"));
+    await bot.handleUpdate(textUpdate(2, `/switch ${sessionId}`));
+
+    const lane = selected();
+    expect(lane.selectedSessionId).toBe(previousSelected);
+    expect(registry.getActiveProvider(lane.laneKey)).toBe("codex");
+    expect(sent.map((entry) => entry.text).join("\n")).toContain("Could not resume Claude session: resume unavailable");
+
+    await bot.handleUpdate(textUpdate(3, `/switch ${sessionId}`));
+    const selection = sent.map((entry) => entry.text ?? "").find((text) => text.includes("Selected #1: Claude"));
+    expect(selection).toContain("Permission mode: acceptEdits");
+    expect(selection).toContain("do not write in both places at once");
+    expect(selection).toContain(`cd "${tempDir}"`);
+    expect(selection).toContain(`claude --resume ${sessionId}`);
+    expect(registry.getActiveProvider(lane.laneKey)).toBe("claude");
+    expect(selected().selectedSessionId).toBeDefined();
   });
 
   it("lists sessions for bare /resume and selects with /resume <n> while Claude is active", async () => {

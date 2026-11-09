@@ -104,6 +104,7 @@ export function renderHelpMessage(): DualText {
         ["/help", "This reference"],
         ["/health", "Bridge health & delivery diagnostics"],
         ["/voice", "Voice transcription status"],
+        ["/video", "Summarize a video by link"],
       ],
     },
     {

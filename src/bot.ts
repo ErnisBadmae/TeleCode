@@ -113,6 +113,7 @@ import { SessionRegistry } from "./session-registry.js";
 import { findRunningClaudeTelegramPluginProcesses } from "./startup-safety.js";
 import { mergeLiveAppServerRateLimits, readLatestCodexUsage, renderUsagePlain } from "./usage.js";
 import { getAvailableBackends, transcribeAudio } from "./voice.js";
+import { summarizeVideo, videoSummaryConfigured } from "./video-summary.js";
 import { extractVoiceBlock, synthesizeVoice, VOICE_REPLY_INSTRUCTION, voiceReplyConfigFromEnv } from "./voice-reply.js";
 import { normalizePersistedWorkspace } from "./workspace-normalization.js";
 
@@ -199,6 +200,7 @@ const TELECODE_COMMANDS_WHILE_CLAUDE_ACTIVE = new Set([
   "velocity",
   "progress",
   "voice",
+  "video",
   "mcp",
   "newsummary",
 ]);
@@ -4007,7 +4009,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       workspace: pick.workspace,
       displayName: pick.title,
       providerSessionId: pick.providerSessionId,
-      select: true,
+      select: false,
       metadata: pick.metadata,
     });
   };
@@ -4060,14 +4062,27 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       }
 
       const target = await materializeProviderSessionPick(contextKey, targetPick);
+      let descriptor: AgentSessionDescriptor;
+      try {
+        descriptor = switchingClaudeSession
+          ? await resumeClaudeAgentSession(contextKey, target)
+          : currentClaude ?? await resumeClaudeAgentSession(contextKey, target);
+      } catch (error) {
+        const message = `Could not resume Claude session: ${friendlyErrorText(error)}. Previous session remains selected.`;
+        await safeReply(ctx, escapeHTML(message), { fallbackText: message });
+        return true;
+      }
       registry.setActiveProvider(contextKey, "claude");
       agentSessions.selectSession(contextKey, target.id);
       persistAgentSessionState();
-      const descriptor = switchingClaudeSession
-        ? await resumeClaudeAgentSession(contextKey, target)
-        : currentClaude ?? await resumeClaudeAgentSession(contextKey, target);
       await flushBufferedPriority(ctx, contextKey, descriptor, parseContextKey(contextKey).messageThreadId);
-      const message = formatProviderSessionSelectionMessage(target, listNumber);
+      const message = [
+        formatProviderSessionSelectionMessage(target, listNumber),
+        `Permission mode: ${asClaudePermissionMode(descriptor.metadata?.permissionMode) ?? config.claudePermissionMode}`,
+        "If this session is open in a terminal, do not write in both places at once.",
+        `To continue in a terminal: cd "${descriptor.workspace.replaceAll('"', '\\"')}"`,
+        `claude --resume ${descriptor.providerSessionId ?? target.providerSessionId}`,
+      ].join("\n");
       await safeReply(ctx, formatTelegramHTML(message), { fallbackText: message });
       return true;
     }
@@ -4578,6 +4593,30 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     await safeReply(ctx, `<b>Voice backends:</b> <code>${escapeHTML(joined)}</code>`, {
       fallbackText: `Voice backends: ${joined}`,
     });
+  });
+
+  bot.command("video", async (ctx) => {
+    const url = getCommandArgument(ctx);
+    if (!/^https?:\/\/\S+$/u.test(url)) {
+      await safeReply(ctx, escapeHTML("Usage: /video <link>"), { fallbackText: "Usage: /video <link>" });
+      return;
+    }
+    if (!videoSummaryConfigured()) {
+      const text = "Video summary is not configured: set VIDEO_SUMMARY_PYTHON and VIDEO_SUMMARY_SCRIPT.";
+      await safeReply(ctx, escapeHTML(text), { fallbackText: text });
+      return;
+    }
+    await safeReply(ctx, escapeHTML("⏳ Скачиваю, расшифровываю и пересказываю. Длинное видео — несколько минут."), {
+      fallbackText: "⏳ Скачиваю, расшифровываю и пересказываю. Длинное видео — несколько минут.",
+    });
+    // В фоне: обработка занимает минуты и не должна держать очередь апдейтов.
+    void summarizeVideo(url).then(
+      (summary) => safeReply(ctx, escapeHTML(summary), { fallbackText: summary }),
+      (error: unknown) => {
+        const text = `❌ ${error instanceof Error ? error.message : String(error)}`;
+        return safeReply(ctx, escapeHTML(text), { fallbackText: text });
+      },
+    ).catch(() => {});
   });
 
   bot.command(["new", "fork"], async (ctx) => {
@@ -8115,6 +8154,7 @@ export async function registerCommands(bot: TeleCodeBot): Promise<void> {
     { command: "claude_login", description: "Start Claude Code login" },
     { command: "logout", description: "Sign out" },
     { command: "voice", description: "Voice transcription status" },
+    { command: "video", description: "Summarize a video by link" },
     { command: "handback", description: "Hand thread to Codex CLI" },
     { command: "attach", description: "Bind a Codex thread to this topic" },
     { command: "switch", description: "Switch provider session" },
