@@ -139,10 +139,11 @@ const KEYBOARD_PAGE_SIZE = 6;
 const CLAUDE_LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
 const CLAUDE_PERMISSION_TIMEOUT_MINUTES = 15;
 const ANSI_PATTERN = /\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]|\r/g;
-// A 50-entry default overflows one Telegram message and pushes the list footer
-// into a second chunk. Keep the default inside a single message; `/sessions all`
-// is the escape hatch for the long history.
-const DEFAULT_PROVIDER_SESSION_LIST_LIMIT = 20;
+// Owner's choice: /sessions shows the 5 latest, each with a switch button;
+// `/sessions 20` or `/sessions all` is the escape hatch for the long history.
+const DEFAULT_PROVIDER_SESSION_LIST_LIMIT = 5;
+const MAX_SESSION_SWITCH_BUTTONS = 10;
+const TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS = 2 * 60 * 1000;
 const MAX_PROVIDER_SESSION_LIST_LIMIT = 500;
 const NOOP_PAGE_CALLBACK_DATA = "noop_page";
 const LAUNCH_PROFILES_COMMAND = "/launch_profiles";
@@ -3685,7 +3686,11 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     if (commandName === "resume") {
       if (!argument) {
         const plain = renderUnifiedSessions(contextKey);
-        await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain, messageThreadId });
+        await safeReply(ctx, formatTelegramHTML(plain), {
+          fallbackText: plain,
+          messageThreadId,
+          replyMarkup: sessionSwitchKeyboard(contextKey),
+        });
         return;
       }
       await selectUnifiedAgentSession(ctx, contextKey, argument);
@@ -4020,6 +4025,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     const limit = parseProviderSessionListLimit(rawArg);
     const picks = buildRecentProviderSessionPicks(contextKey, limit);
     if (picks.length === 0) {
+      pendingAgentSessionPicks.delete(contextKey);
       return "No recent provider sessions found. Use /new codex or /new claude.";
     }
 
@@ -4030,9 +4036,23 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
       "",
       limit < MAX_PROVIDER_SESSION_LIST_LIMIT ? `Use /sessions all for up to ${MAX_PROVIDER_SESSION_LIST_LIMIT} sessions.` : undefined,
       "Subagent child threads are omitted here; use /children while a Codex session is selected.",
-      "Use /switch 1 or /use 1. Use /session for technical IDs.",
+      "Tap a button below or use /switch 1. Use /session for technical IDs.",
     ];
     return lines.filter((line): line is string => Boolean(line)).join("\n");
+  };
+
+  // One button per listed session; tapping it does the same as /switch N.
+  const sessionSwitchKeyboard = (contextKey: TelegramContextKey): InlineKeyboard | undefined => {
+    const picks = pendingAgentSessionPicks.get(contextKey)?.slice(0, MAX_SESSION_SWITCH_BUTTONS);
+    if (!picks?.length) {
+      return undefined;
+    }
+    const keyboard = new InlineKeyboard();
+    picks.forEach((pick, index) => {
+      const label = `${index + 1}. ${formatProviderDisplayName(pick.provider)}: ${trimLine(pick.title || "(untitled)", 40)}`;
+      keyboard.text(label, `usw_${index + 1}`).row();
+    });
+    return keyboard;
   };
 
   const selectUnifiedAgentSession = async (
@@ -6064,11 +6084,23 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     const agentArg = rawTextForAgent.replace(/^\/(?:sessions|switch|use)(?:@\w+)?\s*/, "").trim();
     if (commandNameFromText(rawTextForAgent) === "sessions") {
       const plain = renderUnifiedSessions(contextKeyForAgent, agentArg);
-      await safeReply(ctx, formatTelegramHTML(plain), { fallbackText: plain });
+      await safeReply(ctx, formatTelegramHTML(plain), {
+        fallbackText: plain,
+        replyMarkup: sessionSwitchKeyboard(contextKeyForAgent),
+      });
       return;
     }
 
     await selectUnifiedAgentSession(ctx, contextKeyForAgent, agentArg);
+  });
+
+  bot.callbackQuery(/^usw_(\d+)$/, async (ctx) => {
+    const contextKey = contextKeyFromCtx(ctx);
+    if (!contextKey) {
+      return;
+    }
+    await ctx.answerCallbackQuery({ text: "Switching..." });
+    await selectUnifiedAgentSession(ctx, contextKey, ctx.match[1] ?? "");
   });
 
   const buildSearchResultPicks = (
@@ -7814,12 +7846,15 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
     let transcript: string | undefined;
     let keptAudioPath: string | undefined;
 
+    const seconds = ctx.message.voice?.duration ?? ctx.message.audio?.duration;
+    bridgeLog("voice", `received lane=${contextKey} duration=${seconds ?? "?"}s`);
     try {
       await ctx.api.sendChatAction(chatId, "typing");
       tempFilePath = await downloadTelegramFile(ctx.api, config.telegramBotToken, fileId);
 
       const result = await transcribeAudio(tempFilePath);
       transcript = result.text.trim();
+      bridgeLog("voice", `transcribed lane=${contextKey} in ${result.durationMs}ms chars=${transcript.length}`);
       if (!transcript) {
         await safeReply(ctx, escapeHTML("Transcription was empty. Please try again or send text instead."), {
           fallbackText: "Transcription was empty. Please try again or send text instead.",
@@ -7833,6 +7868,7 @@ export function createBot(config: TeleCodeConfig, registry: SessionRegistry): Te
 
       // Forward voice notes as prompts without a separate transcription echo.
     } catch (error) {
+      bridgeLog("voice", `failed lane=${contextKey}: ${friendlyErrorText(error)}`);
       const note = "Note: voice transcription uses OPENAI_API_KEY, not CODEX_API_KEY.";
       await safeReply(ctx, `<b>Transcription failed:</b>\n${escapeHTML(friendlyErrorText(error))}\n\n<i>${escapeHTML(note)}</i>`, {
         fallbackText: `Transcription failed:\n${friendlyErrorText(error)}\n\n${note}`,
@@ -8706,7 +8742,8 @@ async function downloadTelegramFile(
   }
 
   const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
-  const response = await fetch(url);
+  // A stalled proxy connection must fail the download, not keep the lane "transcribing" forever.
+  const response = await fetch(url, { signal: AbortSignal.timeout(TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS) });
   if (!response.ok) {
     throw new Error(`Failed to download Telegram file: ${response.status}`);
   }

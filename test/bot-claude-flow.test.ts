@@ -1045,6 +1045,27 @@ describe("Claude bot flow", () => {
     expect(selection).toBeDefined();
   });
 
+  it("switches sessions with the /sessions button", async () => {
+    const { bot, sent } = await createTestBot(tempDir);
+
+    await bot.handleUpdate(textUpdate(1, "/claude hello"));
+    await waitFor(() => mockClaude.prompts.includes("hello"));
+    await bot.handleUpdate(textUpdate(2, "/sessions"));
+    await bot.handleUpdate({
+      update_id: 3,
+      callback_query: {
+        id: "cb-1",
+        from: { id: 123, is_bot: false, first_name: "Tester" },
+        chat_instance: "1",
+        data: "usw_1",
+        message: textMessage(2, "Recent provider sessions"),
+      },
+    });
+
+    expect(sent.some((entry) => entry.method === "answerCallbackQuery")).toBe(true);
+    expect(sent.map((entry) => entry.text).find((text) => text?.includes("Selected #1"))).toBeDefined();
+  });
+
   it("keeps the previous choice on failed Claude resume and shows resume details on success", async () => {
     const sessionId = "33333333-3333-4333-8333-333333333333";
     const transcriptDir = path.join(tempDir, ".claude-config", "projects", "project");
